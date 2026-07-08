@@ -2,9 +2,9 @@
 
 A single, auditable Python script (`gex.py`) that estimates **dealer gamma
 exposure** and the **gamma-flip (zero-gamma) level** for SPX, to set a daily
-0DTE trading bias. It pulls the full options-chain snapshot from Polygon.io,
-**recomputes gamma itself with Black-Scholes-Merton** (it does *not* trust the
-vendor greeks), and prints a plain-text bias summary plus a per-strike chart.
+0DTE trading bias. It pulls the full options-chain snapshot from the **Charles
+Schwab Trader API**, **recomputes gamma itself with Black-Scholes-Merton** (it does
+*not* trust the vendor greeks), and prints a plain-text bias summary plus a per-strike chart.
 
 Built to prioritize **correctness and auditability over features**: every
 modeling assumption is written in code comments *and* printed at runtime.
@@ -15,42 +15,73 @@ modeling assumption is written in code comments *and* printed at runtime.
 
 ```bash
 pip install -r requirements.txt
-export POLYGON_API_KEY=...        # never hardcoded; read from the environment
 ```
 
-> Python **3.11+** is the target. The code is deliberately kept compatible with
-> **3.9+** (uses `from __future__ import annotations`, no 3.10-only syntax), so it
-> also runs on stock macOS Python 3.9 — that is what it was developed/tested on.
+> Python **3.11+** is the target. The core is kept compatible with **3.9+** (uses
+> `from __future__ import annotations`, no 3.10-only syntax), so `--demo` and the
+> tests run on stock macOS Python 3.9. The **live Schwab path uses `schwab-py`,
+> which needs Python ≥ 3.10** — its import is lazy, and `pip install -r
+> requirements.txt` skips it automatically on 3.9 (via an environment marker).
+
+## Schwab setup (one time)
+
+Data comes from the **Charles Schwab Trader API** (Market Data) via the
+[`schwab-py`](https://schwab-py.readthedocs.io) library — **free with a Schwab
+brokerage account** (no per-asset entitlement), and the whole chain (spot + OI +
+IV) arrives in one `get_option_chain()` call. This mirrors the sibling
+`overnight_vs_intraday` project's setup, so the token file is interchangeable.
+
+1. At **developer.schwab.com**, create an app, add the **Market Data Production**
+   product, and set the callback URL to **`https://127.0.0.1:8182`**. Wait for the
+   app status to reach **Ready For Use** (Schwab approves manually — can take days).
+2. Provide credentials (never hardcoded). Easiest: copy the template and source it:
+   ```bash
+   cp .env.example .env          # then fill in SCHWAB_APP_KEY / SCHWAB_APP_SECRET
+   set -a; source .env; set +a   # load into the shell
+   ```
+   (or just `export SCHWAB_APP_KEY=... SCHWAB_APP_SECRET=...`).
+3. Install `schwab-py` (Python ≥ 3.10) and run the guided login + live check:
+   ```bash
+   pip install 'schwab-py>=1.3'
+   python3 scripts/schwab_setup.py            # browser flow; --manual for copy/paste
+   ```
+   This opens a browser, writes the token to **`.schwab_token.json`** (git-ignored),
+   then pulls a tiny SPX chain and parses it to confirm everything works. The
+   refresh token lasts ~7 days, so re-run weekly.
+
+No credentials yet? Use `python3 gex.py --demo` for an offline synthetic chain.
 
 ## Run
 
 ```bash
 python3 gex.py                       # default: 0DTE AND all expiries, side by side
 python3 gex.py --expiry 0dte         # 0DTE only
-python3 gex.py --expiry all          # all expiries only
+python3 gex.py --expiry all          # all expiries (out to --all-days)
 python3 gex.py --expiry 2026-06-19   # a specific expiration
 python3 gex.py --rate 0.043 --div-yield 0.013   # override r and q
 python3 gex.py --convention flipped  # flip the dealer sign convention
-python3 gex.py --demo                # offline synthetic chain (no API key needed)
+python3 gex.py --ticker SPY          # SPY ETF options proxy
+python3 gex.py --demo                # offline synthetic chain (no credentials)
 ```
 
-Useful flags: `--ticker` (default SPX -> `I:SPX`), `--multiplier` (100),
+Useful flags: `--ticker` (default SPX → `$SPX`; e.g. `SPY` for the ETF),
+`--all-days` (window for `all`/default, default 365), `--multiplier` (100),
 `--price-range` (±5% flip-search window), `--steps` (grid resolution),
 `--call-sign`/`--put-sign` (raw sign overrides), `--no-plot`, `--out-prefix`,
-`--max-pages`, `--sleep` (for free-tier rate limits). See `python3 gex.py --help`.
+`--callback`, `--token-path`. See `python3 gex.py --help`.
 
 ---
 
 ## Methodology (the part that matters)
 
-**1. BSM gamma** — identical for calls and puts, computed from Polygon's IV:
+**1. BSM gamma** — identical for calls and puts, computed from Schwab's IV:
 
 ```
 gamma = phi(d1) / (S * sigma * sqrt(T))
 d1    = [ ln(S/K) + (r - q + 0.5*sigma^2) * T ] / (sigma * sqrt(T))
 ```
 
-`S`=spot, `K`=strike, `sigma`=implied vol (Polygon IV), `T`=time-to-expiry in
+`S`=spot, `K`=strike, `sigma`=implied vol (Schwab IV), `T`=time-to-expiry in
 years (ACT/365, to **16:00 ET** on the expiry — SPXW is PM-settled), `r`=risk-free
 (`--rate`), `q`=dividend yield (`--div-yield`). `T` is floored at 5 minutes so
 at-the-money 0DTE gamma stays finite near the close.
@@ -115,10 +146,13 @@ mean-reverting). `spot < flip` → net **short gamma** (vol-amplifying, trend-pr
   depends on it. This is the biggest weakness — treat the regime as directional
   context, not a precise tradeable level.
 - OI is end-of-prior-session; the intraday 0DTE picture is necessarily stale.
-- Uses Polygon's IV as the input vol; garbage IV in → garbage gamma out.
+- Uses Schwab's IV as the input vol; garbage IV in → garbage gamma out.
 - `q=0` by default (SPX really yields ~1.3%); pass `--div-yield` to include it.
-- Pulling *all* expiries is many paginated requests; a paid Polygon tier is
-  recommended (use `--sleep` on the free tier).
+- Schwab OAuth needs a one-time browser login and an **approved** developer app
+  (approval can take days); `schwab-py` auto-refreshes the ~30-min access token,
+  but the ~7-day refresh token requires re-running `scripts/schwab_setup.py`.
+- The live Schwab path needs **Python ≥ 3.10** (`schwab-py`); `--demo` and the
+  tests run on 3.9.
 
 ## Tests
 

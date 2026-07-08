@@ -3,8 +3,8 @@
 """
 gex.py - Dealer Gamma Exposure (GEX) and gamma-flip estimator for SPX 0DTE bias.
 
-Single-file, auditable tool. It pulls the full options-chain snapshot from
-Polygon.io, recomputes gamma itself with Black-Scholes-Merton (it does NOT trust
+Single-file, auditable tool. It pulls the full options-chain snapshot from the
+Charles Schwab Trader API, recomputes gamma itself with Black-Scholes-Merton (does NOT trust
 the vendor greeks), aggregates dealer dollar-gamma per strike, locates the
 zero-gamma "flip" level by repricing total GEX across hypothetical spot prices,
 finds the call/put walls, and prints a plain-text bias summary plus a chart.
@@ -19,10 +19,10 @@ METHODOLOGY AND ASSUMPTIONS  (made explicit here, in-code, and in the output)
         d1    = [ ln(S/K) + (r - q + 0.5*sigma^2) * T ] / (sigma * sqrt(T))
 
     where phi is the standard-normal PDF, S=spot, K=strike, sigma=implied vol
-    (we use Polygon's IV as the input vol), T=time-to-expiry in YEARS, r=risk-free
+    (we use Schwab's IV as the input vol), T=time-to-expiry in YEARS, r=risk-free
     rate (--rate), q=dividend yield (--div-yield).
 
-    * We compute gamma OURSELVES; the vendor "greeks.gamma" field is ignored.
+    * We compute gamma OURSELVES; the vendor's own gamma/greeks fields are ignored.
     * T is measured in CALENDAR time (ACT/365) to 16:00 US/Eastern on the
       expiration date -- SPXW 0DTE / PM-settled contracts settle at the cash
       close. As T -> 0 the at-the-money gamma explodes (gamma ~ 1/sqrt(T)); we
@@ -76,11 +76,16 @@ so the 0DTE GEX *lags* intraday positioning; the dealer sign convention is an
 assumption; thin early-morning chains are handled by dropping contracts with no
 OI / no IV and reporting the counts.
 
+Setup (one time):
+    export SCHWAB_APP_KEY=...  SCHWAB_APP_SECRET=...   # from developer.schwab.com
+    python3 scripts/schwab_setup.py                    # schwab-py OAuth login + verify
+
 Usage:
-    POLYGON_API_KEY=... python3 gex.py                 # 0DTE + all expiries, SPX
-    POLYGON_API_KEY=... python3 gex.py --expiry 0dte
-    POLYGON_API_KEY=... python3 gex.py --expiry 2026-06-19 --rate 0.043
-    python3 gex.py --demo                               # offline synthetic chain
+    python3 gex.py                 # 0DTE + all expiries, SPX (=$SPX)
+    python3 gex.py --expiry 0dte
+    python3 gex.py --expiry 2026-06-19 --rate 0.043
+    python3 gex.py --ticker SPY    # SPY ETF options proxy (no index entitlement)
+    python3 gex.py --demo          # offline synthetic chain, no credentials
 """
 from __future__ import annotations
 
@@ -97,13 +102,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, date, timezone, timedelta
 
 import numpy as np
-import requests
 from scipy.stats import norm
 
 # ---------------------------------------------------------------------------
 # Defaults / tunables  (ALL are surfaced in the printed assumptions block)
 # ---------------------------------------------------------------------------
-POLYGON_BASE = "https://api.polygon.io"
+# --- Charles Schwab Trader API (data source; auth via the schwab-py library) ---
+# OAuth + token refresh are handled by schwab-py (see scripts/schwab_setup.py),
+# mirroring the sibling overnight_vs_intraday project's setup.
+DEFAULT_CALLBACK   = "https://127.0.0.1:8182"   # must EXACTLY match your Schwab app's callback
+DEFAULT_TOKEN_PATH = ".schwab_token.json"        # project-local token file (git-ignored)
 
 DEFAULT_TICKER       = "SPX"
 DEFAULT_MULTIPLIER   = 100        # SPX/SPXW index-option contract multiplier
@@ -118,8 +126,7 @@ SPY_RATIO_FALLBACK    = 10.0      # used only if the live SPX/SPY ratio is unava
 MATERIAL_FLIP_MOVE    = 0.01      # flip move > 1% of spot under flipped sign => LOW CONFIDENCE
 PLOT_WINDOW_FRAC      = 0.08      # chart x-axis: spot +/- 8%
 
-# Polygon underlying symbols for cash indices need an "I:" prefix.
-INDEX_TICKERS = {"SPX", "NDX", "RUT", "VIX", "DJX", "XSP", "OEX", "XEO", "XAU", "HGX"}
+# Schwab cash-index symbols carry a "$" prefix (see SCHWAB_INDEX_SYMBOLS below).
 
 
 # ---------------------------------------------------------------------------
@@ -361,140 +368,147 @@ def enrich_and_filter_time(contracts, now):
 
 
 # ===========================================================================
-# Polygon.io fetch
+# Charles Schwab Trader API -- Market Data (option chains) via schwab-py
 # ===========================================================================
-def to_api_ticker(ticker):
+# Auth + token refresh are delegated to the schwab-py library (mirrors the
+# sibling overnight_vs_intraday project):
+#   * Register an app at developer.schwab.com -> App Key + App Secret (from env
+#     SCHWAB_APP_KEY / SCHWAB_APP_SECRET; NEVER hardcoded), callback :8182.
+#   * Run `python3 scripts/schwab_setup.py` ONCE to log in via browser and write
+#     the token file (.schwab_token.json); refresh tokens last ~7 days.
+#   * schwab-py needs Python >= 3.10, so its import is LAZY -- --demo and the unit
+#     tests still run on 3.9. One get_option_chain() call returns the whole chain
+#     plus the underlying spot, OI and IV; Schwab market data is free.
+
+SCHWAB_INDEX_SYMBOLS = {  # cash indices take a "$" prefix on Schwab
+    "SPX": "$SPX", "NDX": "$NDX", "RUT": "$RUT", "VIX": "$VIX", "DJI": "$DJI",
+}
+
+
+def to_schwab_symbol(ticker):
+    """Map a friendly ticker to Schwab's symbol ('SPX' -> '$SPX'; 'SPY' stays 'SPY')."""
     t = ticker.upper().strip()
-    if ":" in t:
+    if t.startswith("$"):
         return t
-    if t in INDEX_TICKERS:
-        return "I:" + t
-    return t  # equity / ETF
+    return SCHWAB_INDEX_SYMBOLS.get(t, t)
 
 
-def _get_with_retry(session, url, params, max_retries=5, timeout=30):
-    """GET with exponential backoff on HTTP 429 (rate limit)."""
-    delay = 1.0
-    last = None
-    for _ in range(max_retries):
-        resp = session.get(url, params=params, timeout=timeout)
-        last = resp
-        if resp.status_code == 429:
-            time.sleep(delay)
-            delay = min(delay * 2, 16.0)
-            continue
-        resp.raise_for_status()
-        return resp
-    last.raise_for_status()
-    return last
+def get_schwab_client(app_key, app_secret, token_path, callback=DEFAULT_CALLBACK):
+    """Build a schwab-py client from a cached token file.
 
-
-def fetch_chain(api_ticker, api_key, session=None, expiration=None,
-                max_pages=400, sleep=0.0):
-    """Pull the full options-chain snapshot (paginated). Returns (results, meta).
-
-    `expiration` (YYYY-MM-DD) narrows the server-side query for single-expiry
-    runs; leave None to fetch every expiry (needed for the all-expiries view and
-    the 0DTE-vs-later fraction).
+    OAuth and token refresh are delegated to schwab-py (the token is written by
+    scripts/schwab_setup.py). Raises a clear RuntimeError if the credentials or
+    token file are missing, or if schwab-py isn't installed. The ``schwab`` import
+    is LAZY so the rest of the tool -- and the unit tests -- run on Python 3.9,
+    where schwab-py (which needs >= 3.10) cannot be installed.
     """
-    session = session or requests.Session()
-    url = "{}/v3/snapshot/options/{}".format(POLYGON_BASE, api_ticker)
-    params = {"limit": 250, "apiKey": api_key}
-    if expiration:
-        params["expiration_date"] = expiration
-
-    results, pages = [], 0
-    while url and pages < max_pages:
-        resp = _get_with_retry(session, url, params)
-        params = None  # next_url already carries the query string
-        data = resp.json()
-        results.extend(data.get("results") or [])
-        url = data.get("next_url")
-        if url:
-            sep = "&" if "?" in url else "?"
-            url = "{}{}apiKey={}".format(url, sep, api_key)
-        pages += 1
-        if sleep:
-            time.sleep(sleep)
-    return results, {"pages": pages}
-
-
-def fetch_index_or_last_price(api_ticker, api_key, session):
-    """Fallback spot lookup if the chain snapshot didn't carry underlying price."""
+    if not (app_key and app_secret):
+        raise RuntimeError(
+            "SCHWAB_APP_KEY / SCHWAB_APP_SECRET not set. Register a Market Data app "
+            "on developer.schwab.com and export the credentials.")
+    if not os.path.exists(token_path):
+        raise RuntimeError(
+            "No Schwab token at {!r}. Run the one-time login first:\n"
+            "    python3 scripts/schwab_setup.py\n"
+            "(refresh tokens expire after ~7 days, so re-run weekly).".format(token_path))
     try:
-        if api_ticker.startswith("I:"):
-            r = session.get("{}/v3/snapshot/indices".format(POLYGON_BASE),
-                            params={"ticker.any_of": api_ticker, "apiKey": api_key},
-                            timeout=15)
-            if r.ok:
-                res = r.json().get("results") or []
-                if res and res[0].get("value") is not None:
-                    return float(res[0]["value"])
-        else:
-            r = session.get("{}/v2/last/trade/{}".format(POLYGON_BASE, api_ticker),
-                            params={"apiKey": api_key}, timeout=15)
-            if r.ok:
-                p = (r.json().get("results") or {}).get("p")
-                if p:
-                    return float(p)
-    except Exception:
-        pass
-    return None
+        from schwab.auth import client_from_token_file
+    except ImportError as exc:
+        raise RuntimeError(
+            "schwab-py is required for live data: pip install 'schwab-py>=1.3' "
+            "(needs Python >= 3.10).") from exc
+    return client_from_token_file(token_path, app_key, app_secret)
 
 
-def fetch_spy_ratio(spx_spot, api_key, session):
-    """Live SPX/SPY ratio. Returns (ratio, spy_price, source_label)."""
-    for path, extract in (
-        ("/v2/last/trade/SPY", lambda j: (j.get("results") or {}).get("p")),
-        ("/v2/aggs/ticker/SPY/prev", lambda j: ((j.get("results") or [{}])[0]).get("c")),
-    ):
-        try:
-            r = session.get(POLYGON_BASE + path, params={"apiKey": api_key}, timeout=15)
-            if r.ok:
-                spy = extract(r.json())
-                if spy:
-                    src = "live last trade" if "last" in path else "prev close"
-                    return spx_spot / float(spy), float(spy), src
-        except Exception:
-            pass
-    return SPY_RATIO_FALLBACK, None, "fallback (hardcoded ~10, NOT live)"
+def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_count=None):
+    """One schwab-py get_option_chain() call -> full chain JSON (spot + OI + IV).
+
+    `client` is a schwab-py client (see get_schwab_client). `from_date`/`to_date`
+    are datetime.date objects. contractType defaults to ALL server-side, so both
+    callExpDateMap and putExpDateMap come back in one un-paginated payload.
+    """
+    kwargs = {"include_underlying_quote": True}
+    if from_date is not None:
+        kwargs["from_date"] = from_date
+    if to_date is not None:
+        kwargs["to_date"] = to_date
+    if strike_count is not None:
+        kwargs["strike_count"] = strike_count
+    resp = client.get_option_chain(symbol, **kwargs)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def parse_contracts(results):
-    """Turn raw snapshot results into Contract objects + spot + metadata.
+def parse_schwab_chain(data):
+    """Parse a Schwab /chains response into (contracts, spot, ts_ns, dropped, status).
 
-    Skips contracts with no/zero OI or no/zero IV (thin chains), counting drops.
+    Schwab specifics handled here:
+      * callExpDateMap / putExpDateMap are keyed "YYYY-MM-DD:DTE" -> strike -> [opt].
+        We take the expiration date from the map key (most reliable).
+      * `volatility` is a PERCENT (e.g. 18.42) and uses -999.0 / non-finite as the
+        "no IV" sentinel -> convert to a decimal and drop sentinels.
+      * spot comes straight from `underlyingPrice` (fallback underlying.mark/last).
+      * Skips contracts with no/zero OI or no/sentinel IV, counting the drops.
     """
     contracts = []
-    spot = None
-    ts_ns = None
     dropped = {"no_oi": 0, "no_iv": 0, "malformed": 0}
+    status = data.get("status")
 
-    for r in results:
-        d = r.get("details") or {}
-        cp = d.get("contract_type")
-        strike = d.get("strike_price")
-        exp = d.get("expiration_date")
-        oi = r.get("open_interest")
-        iv = r.get("implied_volatility")
-        ua = r.get("underlying_asset") or {}
-        if spot is None and ua.get("price") is not None:
-            spot = float(ua["price"])
-        if ts_ns is None and ua.get("last_updated") is not None:
-            ts_ns = ua["last_updated"]
+    under = data.get("underlying") or {}
+    spot = data.get("underlyingPrice")
+    if spot is None:
+        spot = under.get("mark") or under.get("last")
+    spot = float(spot) if spot is not None else None
 
-        if cp not in ("call", "put") or strike is None or not exp:
-            dropped["malformed"] += 1
-            continue
-        if oi is None or float(oi) <= 0:
-            dropped["no_oi"] += 1
-            continue
-        if iv is None or float(iv) <= 0:
-            dropped["no_iv"] += 1
-            continue
-        contracts.append(Contract(float(strike), date.fromisoformat(exp),
-                                  cp, float(oi), float(iv)))
-    return contracts, spot, ts_ns, dropped
+    # Underlying quote time is ms-epoch; convert to ns to match the rest of the tool.
+    ts_ms = under.get("quoteTime") or under.get("tradeTime")
+    ts_ns = int(ts_ms) * 1_000_000 if ts_ms else None
+
+    for map_key, cp in (("callExpDateMap", "call"), ("putExpDateMap", "put")):
+        exp_map = data.get(map_key) or {}
+        for exp_key, by_strike in exp_map.items():
+            try:
+                exp_date = date.fromisoformat(str(exp_key).split(":")[0])
+            except ValueError:
+                dropped["malformed"] += sum(len(v) for v in by_strike.values())
+                continue
+            for strike_str, opts in by_strike.items():
+                for o in opts:
+                    try:
+                        strike = float(o.get("strikePrice", strike_str))
+                    except (TypeError, ValueError):
+                        dropped["malformed"] += 1
+                        continue
+                    oi = o.get("openInterest")
+                    if oi is None or float(oi) <= 0:
+                        dropped["no_oi"] += 1
+                        continue
+                    try:
+                        ivf = float(o.get("volatility"))
+                    except (TypeError, ValueError):
+                        dropped["no_iv"] += 1
+                        continue
+                    # -999.0 is Schwab's "no IV" sentinel; also guard NaN/inf/<=0.
+                    if not math.isfinite(ivf) or ivf <= 0 or ivf <= -998.0:
+                        dropped["no_iv"] += 1
+                        continue
+                    contracts.append(Contract(strike, exp_date, cp,
+                                              float(oi), ivf / 100.0))
+    return contracts, spot, ts_ns, dropped, status
+
+
+def fetch_spy_ratio_schwab(client, spx_spot):
+    """Live SPX/SPY ratio from a Schwab SPY quote. Returns (ratio, spy_px, source)."""
+    try:
+        resp = client.get_quote("SPY")
+        resp.raise_for_status()
+        q = ((resp.json().get("SPY") or {}).get("quote")) or {}
+        spy = q.get("lastPrice") or q.get("mark") or q.get("closePrice")
+        if spy:
+            return spx_spot / float(spy), float(spy), "Schwab SPY quote"
+    except Exception:
+        pass
+    return SPY_RATIO_FALLBACK, None, "fallback (hardcoded ~10, NOT live)"
 
 
 # ===========================================================================
@@ -587,8 +601,9 @@ def print_assumptions(cfg, rate_is_default):
     print("=" * 78)
     print("ASSUMPTIONS  (every number below is a modeling choice, not ground truth)")
     print("=" * 78)
-    print("  Gamma source ........ computed via Black-Scholes-Merton from Polygon IV")
-    print("                        (vendor greeks.gamma is IGNORED).")
+    print("  Data source ......... Charles Schwab Trader API (Market Data /chains)")
+    print("  Gamma source ........ computed via Black-Scholes-Merton from Schwab IV")
+    print("                        (Schwab's own gamma/greeks are IGNORED).")
     print("  Dealer convention ... {}".format(cfg.convention.label))
     print("                        call_sign={:+.0f}  put_sign={:+.0f}  (flippable)"
           .format(cfg.convention.call_sign, cfg.convention.put_sign))
@@ -844,7 +859,7 @@ def parse_args(argv=None):
         description="Dealer gamma exposure (GEX) and gamma-flip estimator (SPX 0DTE bias).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--ticker", default=DEFAULT_TICKER,
-                   help="underlying (SPX -> I:SPX automatically).")
+                   help="underlying (SPX -> $SPX automatically; pass SPY for the ETF).")
     p.add_argument("--expiry", default=None,
                    help="'0dte' | 'all' | YYYY-MM-DD. Default: compute BOTH 0DTE and all expiries.")
     p.add_argument("--rate", type=float, default=DEFAULT_RATE, help="risk-free rate (annual, decimal).")
@@ -856,11 +871,16 @@ def parse_args(argv=None):
                    help="dealer sign convention. standard=long calls/short puts.")
     p.add_argument("--call-sign", type=float, default=None, help="override dealer call sign (+1/-1).")
     p.add_argument("--put-sign", type=float, default=None, help="override dealer put sign (+1/-1).")
+    p.add_argument("--all-days", type=int, default=365,
+                   help="for 'all'/default: fetch expiries from today out this many days.")
     p.add_argument("--out-prefix", default=None, help="output chart filename prefix.")
     p.add_argument("--no-plot", action="store_true", help="skip chart generation.")
-    p.add_argument("--max-pages", type=int, default=400, help="pagination safety cap.")
-    p.add_argument("--sleep", type=float, default=0.0, help="seconds to sleep between pages (free-tier rate limits).")
-    p.add_argument("--demo", action="store_true", help="run on an offline synthetic chain (no API key needed).")
+    p.add_argument("--callback", default=os.environ.get("SCHWAB_CALLBACK_URL", DEFAULT_CALLBACK),
+                   help="OAuth callback URL; must EXACTLY match your Schwab app config.")
+    p.add_argument("--token-path", default=None,
+                   help="Schwab token file (default .schwab_token.json or $SCHWAB_TOKEN_PATH). "
+                        "Create it with: python3 scripts/schwab_setup.py")
+    p.add_argument("--demo", action="store_true", help="run on an offline synthetic chain (no credentials).")
     return p.parse_args(argv)
 
 
@@ -980,44 +1000,59 @@ def main(argv=None):
         print("runtime: {:.2f}s".format(time.time() - t_start))
         return 0
 
-    api_key = os.environ.get("POLYGON_API_KEY")
-    if not api_key:
-        print("ERROR: set POLYGON_API_KEY in your environment (never hardcode it).",
+    app_key = os.environ.get("SCHWAB_APP_KEY")
+    app_secret = os.environ.get("SCHWAB_APP_SECRET")
+    if not app_key or not app_secret:
+        print("ERROR: set SCHWAB_APP_KEY and SCHWAB_APP_SECRET in your environment "
+              "(never hardcode them).", file=sys.stderr)
+        print("       Create a Market-Data app at developer.schwab.com to get them.",
               file=sys.stderr)
         print("       Or run `python3 gex.py --demo` for an offline synthetic example.",
               file=sys.stderr)
         return 2
 
-    api_ticker = to_api_ticker(cfg.ticker)
-    session = requests.Session()
+    token_path = args.token_path or os.environ.get("SCHWAB_TOKEN_PATH", DEFAULT_TOKEN_PATH)
+    try:
+        client = get_schwab_client(app_key, app_secret, token_path, callback=args.callback)
+    except RuntimeError as e:
+        print("ERROR: {}".format(e), file=sys.stderr)
+        return 2
 
-    # Narrow the server-side query for single-expiry runs; full pull otherwise.
-    server_expiry = None
+    # Translate --expiry into a date window (date objects for schwab-py). Schwab
+    # returns one un-paginated payload for the whole window; we still partition in
+    # memory so the default run shows 0DTE and all-expiries side by side.
     if args.expiry and args.expiry.lower() == "0dte":
-        server_expiry = today.isoformat()
-    elif args.expiry and args.expiry.lower() not in ("all",):
+        from_date = to_date = today
+    elif args.expiry and args.expiry.lower() == "all":
+        from_date, to_date = today, today + timedelta(days=args.all_days)
+    elif args.expiry:
         try:
-            date.fromisoformat(args.expiry)
-            server_expiry = args.expiry
+            from_date = to_date = date.fromisoformat(args.expiry)
         except ValueError:
             print("ERROR: --expiry must be '0dte', 'all', or YYYY-MM-DD.", file=sys.stderr)
             return 2
+    else:  # default: both 0DTE and all -> fetch the full near-dated window
+        from_date, to_date = today, today + timedelta(days=args.all_days)
 
-    print("Fetching chain snapshot for {} ...".format(api_ticker))
+    symbol = to_schwab_symbol(cfg.ticker)
+    print("Fetching Schwab option chain for {} ({} .. {}) ...".format(symbol, from_date, to_date))
     try:
-        results, meta = fetch_chain(api_ticker, api_key, session,
-                                    expiration=server_expiry, max_pages=args.max_pages,
-                                    sleep=args.sleep)
-    except requests.HTTPError as e:
+        data = fetch_chain_schwab(client, symbol, from_date=from_date, to_date=to_date)
+        # Some index symbols use the legacy '.X' suffix; retry once if unsuccessful.
+        if data.get("status") != "SUCCESS" and symbol.startswith("$") and not symbol.endswith(".X"):
+            data = fetch_chain_schwab(client, symbol + ".X", from_date=from_date, to_date=to_date)
+    except Exception as e:  # schwab-py uses httpx; catch any transport/HTTP error
         print("ERROR fetching chain: {}".format(e), file=sys.stderr)
         return 1
-    print("  {} pages, {} raw contracts.".format(meta["pages"], len(results)))
 
-    contracts, spot, ts_ns, dropped = parse_contracts(results)
+    contracts, spot, ts_ns, dropped, status = parse_schwab_chain(data)
+    if status and status != "SUCCESS":
+        print("  WARNING: Schwab chains status = {}".format(status))
+    print("  {} raw contracts parsed.".format(
+        len(contracts) + dropped["no_oi"] + dropped["no_iv"] + dropped["malformed"]))
     if spot is None:
-        spot = fetch_index_or_last_price(api_ticker, api_key, session)
-    if spot is None:
-        print("ERROR: could not determine underlying spot price.", file=sys.stderr)
+        print("ERROR: could not determine underlying spot price from the chain.",
+              file=sys.stderr)
         return 1
 
     all_contracts, dropped_expired, floored = enrich_and_filter_time(contracts, now_et())
@@ -1026,8 +1061,8 @@ def main(argv=None):
 
     spy_ratio = SPY_RATIO_FALLBACK
     ratio_src = "fallback"
-    if api_ticker == "I:SPX":
-        spy_ratio, spy_px, ratio_src = fetch_spy_ratio(spot, api_key, session)
+    if symbol in ("$SPX", "$SPX.X"):
+        spy_ratio, spy_px, ratio_src = fetch_spy_ratio_schwab(client, spot)
     print("  SPX/SPY ratio: {:.3f} ({})\n".format(spy_ratio, ratio_src))
 
     run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,

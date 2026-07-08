@@ -25,6 +25,9 @@ from gex import (
     find_flip_level,
     compute_gex_profile,
     find_walls,
+    parse_schwab_chain,
+    to_schwab_symbol,
+    get_schwab_client,
 )
 
 
@@ -157,3 +160,90 @@ def test_net_total_sign_flips_with_convention():
     flp = compute_gex_profile(contracts, 100.0, CONV_FLIPPED, cfg)["total"]
     assert std < 0 < flp            # short puts (std) negative, long puts (flipped) positive
     assert std == pytest.approx(-flp, rel=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Schwab data layer (the riskiest new code; no network touched)
+# ---------------------------------------------------------------------------
+def test_to_schwab_symbol():
+    assert to_schwab_symbol("SPX") == "$SPX"
+    assert to_schwab_symbol("spx") == "$SPX"
+    assert to_schwab_symbol("SPY") == "SPY"          # ETF passes through unchanged
+    assert to_schwab_symbol("$SPX.X") == "$SPX.X"    # already-prefixed passes through
+
+
+# A hand-built response in Schwab's exact shape (callExpDateMap/putExpDateMap,
+# volatility as a percent, -999.0 sentinel, OI=0 line). No network needed.
+SCHWAB_SAMPLE = {
+    "status": "SUCCESS",
+    "underlyingPrice": 5900.0,
+    "underlying": {"quoteTime": 1_718_040_000_000, "last": 5899.5, "mark": 5900.5},
+    "callExpDateMap": {
+        "2026-06-10:0": {
+            "5900.0": [{"putCall": "CALL", "strikePrice": 5900.0,
+                        "openInterest": 1000, "volatility": 18.42}],   # valid
+            "5905.0": [{"putCall": "CALL", "strikePrice": 5905.0,
+                        "openInterest": 0, "volatility": 18.0}],        # dropped: OI=0
+        }
+    },
+    "putExpDateMap": {
+        "2026-06-10:0": {
+            "5900.0": [{"putCall": "PUT", "strikePrice": 5900.0,
+                        "openInterest": 1200, "volatility": -999.0}],   # dropped: IV sentinel
+            "5895.0": [{"putCall": "PUT", "strikePrice": 5895.0,
+                        "openInterest": 800, "volatility": 20.0}],      # valid
+        }
+    },
+}
+
+
+def test_parse_schwab_chain():
+    contracts, spot, ts_ns, dropped, status = parse_schwab_chain(SCHWAB_SAMPLE)
+    assert status == "SUCCESS"
+    assert spot == 5900.0
+    assert ts_ns == 1_718_040_000_000 * 1_000_000     # ms-epoch -> ns
+    assert len(contracts) == 2                          # 1 call + 1 put survive
+    assert dropped["no_oi"] == 1
+    assert dropped["no_iv"] == 1
+
+    by_type = {c.cp: c for c in contracts}
+    assert set(by_type) == {"call", "put"}
+    assert by_type["call"].iv == pytest.approx(0.1842)  # percent -> decimal
+    assert by_type["call"].strike == 5900.0
+    assert by_type["put"].iv == pytest.approx(0.20)
+    assert by_type["put"].strike == 5895.0
+    assert by_type["call"].expiry == date(2026, 6, 10)  # date from the map key
+
+
+def test_parse_schwab_chain_empty_is_graceful():
+    contracts, spot, ts_ns, dropped, status = parse_schwab_chain(
+        {"status": "SUCCESS", "underlyingPrice": 100.0})
+    assert contracts == []
+    assert spot == 100.0
+    assert ts_ns is None
+
+
+def test_get_schwab_client_errors_without_creds_or_token(tmp_path):
+    # get_schwab_client raises a clear RuntimeError BEFORE importing schwab-py,
+    # so these checks pass on Python 3.9 (where schwab-py can't be installed).
+    import gex
+
+    with pytest.raises(RuntimeError):                       # missing credentials
+        gex.get_schwab_client(None, None, str(tmp_path / "t.json"))
+    with pytest.raises(RuntimeError):                       # missing token file
+        gex.get_schwab_client("KEY", "SECRET", str(tmp_path / "missing.json"))
+
+
+def test_schwab_setup_script_importable():
+    # Importing scripts/schwab_setup.py catches syntax/import regressions. The
+    # schwab-py import is lazy (inside main), so this works without schwab-py.
+    import importlib.util
+    import os
+
+    path = os.path.join(os.path.dirname(__file__), "scripts", "schwab_setup.py")
+    spec = importlib.util.spec_from_file_location("schwab_setup", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert callable(mod.main)
+    assert isinstance(mod.CALLBACK, str) and mod.CALLBACK
+    assert mod.TOKEN_PATH  # default token path is defined
