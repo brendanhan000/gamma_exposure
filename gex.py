@@ -672,6 +672,16 @@ def print_side_by_side(views):
     print()
 
 
+def cross_quote(ticker, value, spy_ratio):
+    """Cross-quote a level between SPX and SPY. Returns (other_label, value) or None."""
+    t = ticker.upper().lstrip("$")
+    if t == "SPX":
+        return ("SPY", value / spy_ratio)   # SPX -> SPY (divide by ~10)
+    if t == "SPY":
+        return ("SPX", value * spy_ratio)   # SPY -> SPX (multiply by ~10)
+    return None
+
+
 def print_view_detail(label, view, spot, spy_ratio, cfg):
     print("-" * 78)
     print("VIEW: {}".format(label))
@@ -692,18 +702,20 @@ def print_view_detail(label, view, spot, spy_ratio, cfg):
         print("    No zero crossing within +/-{:.0%}. Total GEX at spot = {} ({} regime)."
               .format(cfg.price_range, fmt_bn(tot), "LONG" if tot > 0 else "SHORT"))
     else:
-        print("    SPX  {:,.2f}".format(flip))
-        print("    SPY-equiv  {:,.2f}   (SPX/SPY ratio {:.3f})".format(flip / spy_ratio, spy_ratio))
+        print("    {}  {:,.2f}".format(cfg.ticker, flip))
+        eq = cross_quote(cfg.ticker, flip, spy_ratio)
+        if eq:
+            print("    {}-equiv  {:,.2f}   (SPX/SPY ratio {:.3f})".format(eq[0], eq[1], spy_ratio))
         if view["flip_std"]["crossings"].size > 1:
             extra = ", ".join("{:,.0f}".format(c) for c in view["flip_std"]["crossings"])
             print("    NOTE: {} crossings in range [{}]; reporting the one nearest spot."
                   .format(view["flip_std"]["crossings"].size, extra))
 
     # ---- Walls (#3, #4) ----
-    print("  Call wall [#3] (resistance/pin): SPX {}   net GEX {}".format(
-        fmt_px(walls["call_wall"]), fmt_bn(walls["call_wall_gex"])))
-    print("  Put wall  [#4] (support/accel):  SPX {}   net GEX {}".format(
-        fmt_px(walls["put_wall"]), fmt_bn(walls["put_wall_gex"])))
+    print("  Call wall [#3] (resistance/pin): {} {}   net GEX {}".format(
+        cfg.ticker, fmt_px(walls["call_wall"]), fmt_bn(walls["call_wall_gex"])))
+    print("  Put wall  [#4] (support/accel):  {} {}   net GEX {}".format(
+        cfg.ticker, fmt_px(walls["put_wall"]), fmt_bn(walls["put_wall_gex"])))
 
     # ---- Sensitivity / LOW CONFIDENCE (guardrail) ----
     # The dealer put-sign convention is the model's single biggest assumption, so
@@ -764,15 +776,19 @@ def render_summary(label, view, spot, spy_ratio, cfg):
     flip = view["flip_std"]["flip"]
     walls = view["walls"]
     reg = regime_word(spot, flip)
-    print("  Current spot ...... SPX {:,.2f}".format(spot))
+    print("  Current spot ...... {} {:,.2f}".format(cfg.ticker, spot))
     print("  Regime ............ {}  (spot {} flip)".format(
         reg, ">" if (flip is not None and spot > flip) else "<" if flip is not None else "?"))
     if flip is not None:
-        print("  Gamma flip ........ SPX {:,.2f}  |  SPY {:,.2f}".format(flip, flip / spy_ratio))
+        line = "  Gamma flip ........ {} {:,.2f}".format(cfg.ticker, flip)
+        eq = cross_quote(cfg.ticker, flip, spy_ratio)
+        if eq:
+            line += "  |  {} {:,.2f}".format(eq[0], eq[1])
+        print(line)
     else:
         print("  Gamma flip ........ none in +/-{:.0%} window".format(cfg.price_range))
-    print("  Call wall ......... SPX {}".format(fmt_px(walls["call_wall"])))
-    print("  Put wall .......... SPX {}".format(fmt_px(walls["put_wall"])))
+    print("  Call wall ......... {} {}".format(cfg.ticker, fmt_px(walls["call_wall"])))
+    print("  Put wall .......... {} {}".format(cfg.ticker, fmt_px(walls["put_wall"])))
     print("  Total net GEX ..... {}  ({})".format(fmt_bn(view["total"]), fmt_usd(view["total"])))
     print("  Interpretation .... " + interpretation_line(spot, flip, view["total"]))
     print("#" * 78)
@@ -871,8 +887,10 @@ def parse_args(argv=None):
                    help="dealer sign convention. standard=long calls/short puts.")
     p.add_argument("--call-sign", type=float, default=None, help="override dealer call sign (+1/-1).")
     p.add_argument("--put-sign", type=float, default=None, help="override dealer put sign (+1/-1).")
-    p.add_argument("--all-days", type=int, default=365,
-                   help="for 'all'/default: fetch expiries from today out this many days.")
+    p.add_argument("--all-days", type=int, default=45,
+                   help="for 'all'/default: fetch expiries from today out this many days. "
+                        "Kept modest because Schwab 502s on very large chains (e.g. a full "
+                        "year of SPX); raise it for more coverage at the risk of a 502.")
     p.add_argument("--out-prefix", default=None, help="output chart filename prefix.")
     p.add_argument("--no-plot", action="store_true", help="skip chart generation.")
     p.add_argument("--callback", default=os.environ.get("SCHWAB_CALLBACK_URL", DEFAULT_CALLBACK),
@@ -1043,6 +1061,9 @@ def main(argv=None):
             data = fetch_chain_schwab(client, symbol + ".X", from_date=from_date, to_date=to_date)
     except Exception as e:  # schwab-py uses httpx; catch any transport/HTTP error
         print("ERROR fetching chain: {}".format(e), file=sys.stderr)
+        if "502" in str(e) or "Bad Gateway" in str(e):
+            print("  (A 502 usually means the requested chain is too large; "
+                  "reduce --all-days or pass a specific --expiry.)", file=sys.stderr)
         return 1
 
     contracts, spot, ts_ns, dropped, status = parse_schwab_chain(data)
@@ -1057,7 +1078,16 @@ def main(argv=None):
 
     all_contracts, dropped_expired, floored = enrich_and_filter_time(contracts, now_et())
     if not all_contracts:
-        print("WARNING: no usable contracts after filtering (sparse/early chain).")
+        print("WARNING: no usable contracts after filtering.")
+        if not contracts and dropped["no_oi"]:
+            # Everything was dropped for ZERO open interest at parse time.
+            if symbol.startswith("$"):
+                print("  NOTE: Schwab returns ZERO open interest for cash-INDEX options "
+                      "like {}. GEX is OI-weighted, so this source cannot do".format(symbol))
+                print("        index GEX -- use the ETF proxy instead:  --ticker SPY")
+            else:
+                print("  NOTE: all strikes showed 0 open interest. OI is an overnight (OCC) "
+                      "figure; before the morning post it may not be available yet.")
 
     spy_ratio = SPY_RATIO_FALLBACK
     ratio_src = "fallback"
