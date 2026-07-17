@@ -64,11 +64,70 @@ python3 gex.py --ticker SPY          # SPY ETF options proxy
 python3 gex.py --demo                # offline synthetic chain (no credentials)
 ```
 
-Useful flags: `--ticker` (default SPX → `$SPX`; e.g. `SPY` for the ETF),
-`--all-days` (window for `all`/default, default 365), `--multiplier` (100),
+Useful flags: `--ticker` (default SPX → `$SPX`, but **Schwab returns no OI for
+`$SPX`** — use `SPY`/`QQQ`), `--all-days` (window for `all`/default, default 45),
+`--x-tick` (chart gridline spacing, default 10), `--multiplier` (100),
 `--price-range` (±5% flip-search window), `--steps` (grid resolution),
 `--call-sign`/`--put-sign` (raw sign overrides), `--no-plot`, `--out-prefix`,
 `--callback`, `--token-path`. See `python3 gex.py --help`.
+
+---
+
+## Command cheat-sheet (by cadence)
+
+> **Interpreter note (this machine):** the *live* interpreter is
+> `/opt/anaconda3/bin/python` (Python 3.13 with `schwab-py`). The bare `python3` and
+> the `.venv` are 3.9 — use those only for `--demo`/tests. Set a shortcut and load
+> credentials once per terminal:
+> ```bash
+> PY=/opt/anaconda3/bin/python
+> cd /Users/brendanhan/Desktop/Quant_Projects/gamma_exposure
+> set -a; source .env; set +a
+> ```
+
+**One-time — setup**
+```bash
+pip install -r requirements.txt      # deps (schwab-py auto-skipped on 3.9; needs 3.10+ live)
+cp .env.example .env                  # then fill in SCHWAB_APP_KEY / SCHWAB_APP_SECRET
+$PY scripts/schwab_setup.py           # first OAuth login -> writes .schwab_token.json
+```
+
+**Daily — before the open (get the day's levels)**
+```bash
+$PY gex.py --ticker QQQ                # 0DTE + all-expiries: prints levels, saves chart
+$PY gex.py --ticker SPY                # SPY instead of QQQ
+$PY gex.py --ticker QQQ --expiry 0dte  # just today's 0DTE view
+$PY gex.py --ticker QQQ --no-plot      # text only (faster, no chart)
+```
+Check the printed `OI reflects [date]` line — it should read yesterday's session.
+
+**Weekly — re-authenticate (the refresh token expires ~7 days)**
+```bash
+$PY scripts/schwab_setup.py            # re-run the login (add --manual if the browser hangs)
+```
+If a daily run errors with a refresh-token / auth message, this is the fix.
+
+**Monthly — around monthly OpEx (3rd Friday)**
+```bash
+$PY gex.py --ticker QQQ --expiry 2026-08-21   # that monthly expiration's positioning
+$PY gex.py --ticker QQQ --all-days 60          # widen the window to catch the next monthly
+```
+The big walls reset after monthly OpEx — expect materially different levels the next week.
+
+**Quarterly — triple-witching (3rd Fri of Mar/Jun/Sep/Dec) + refresh assumptions**
+```bash
+$PY gex.py --ticker QQQ --rate 0.043 --div-yield 0.013   # update r and q to current values
+pip install -U -r requirements.txt                        # refresh dependencies
+```
+
+**Any time — reference / sanity**
+```bash
+$PY gex.py --demo                       # offline synthetic sample (no credentials)
+$PY gex.py --ticker QQQ --x-tick 25     # chart gridlines every 25 instead of 10
+$PY gex.py --ticker QQQ --convention flipped   # sensitivity: flip the dealer-sign assumption
+$PY gex.py --help                       # every flag
+$PY -m pytest test_gex.py               # run the test suite
+```
 
 ---
 

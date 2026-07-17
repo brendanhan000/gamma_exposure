@@ -798,11 +798,17 @@ def render_summary(label, view, spot, spy_ratio, cfg):
 # ===========================================================================
 # Plot
 # ===========================================================================
-def plot_profile(label, view, spot, flip, walls, ticker, outpath, window_frac=PLOT_WINDOW_FRAC):
-    """Per-strike net-GEX bar chart with spot / flip / walls marked. Saved to file."""
+def plot_profile(label, view, spot, flip, walls, ticker, outpath,
+                 window_frac=PLOT_WINDOW_FRAC, x_tick_step=10.0):
+    """Per-strike net-GEX bar chart with spot / flip / walls marked. Saved to file.
+
+    The x-axis (price) is ticked and gridded on round multiples of `x_tick_step`
+    (default 10), auto-coarsened for high-priced underlyings so labels stay legible.
+    """
     import matplotlib
     matplotlib.use("Agg")  # headless / no display needed
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MultipleLocator
 
     profile = view["profile"]
     strikes = profile["strikes"]
@@ -831,12 +837,28 @@ def plot_profile(label, view, spot, flip, walls, ticker, outpath, window_frac=PL
         ax.axvline(walls["put_wall"], color="#d73027", ls=":", lw=1.8,
                    label="put wall {:,.0f}".format(walls["put_wall"]))
 
+    # X-axis on round price levels: ticks + gridlines every `x_tick_step` (default
+    # 10). Coarsen to a nice multiple (x2, x2.5, x2 -> 20, 50, 100, ...) if the
+    # window would produce too many ticks, so high-priced names (e.g. SPX) stay
+    # readable; multiples of 10 are unaffected for SPY/QQQ-priced underlyings.
+    base = float(x_tick_step) if x_tick_step and x_tick_step > 0 else 10.0
+    span = float(ks.max() - ks.min()) if ks.size else 0.0
+    step = base
+    _bumps = (2.0, 2.5, 2.0)
+    _i = 0
+    while span > 0 and span / step > 25:
+        step *= _bumps[_i % 3]
+        _i += 1
+    ax.xaxis.set_major_locator(MultipleLocator(step))
+    if span > 0 and span / step > 15:   # rotate only when ticks get dense
+        ax.tick_params(axis="x", labelrotation=45)
+
     ax.set_title("{} dealer GEX profile - {}  (green=long gamma, red=short gamma)"
                  .format(ticker, label))
-    ax.set_xlabel("strike")
+    ax.set_xlabel("strike / price level  (gridlines every {:g})".format(step))
     ax.set_ylabel("net dealer GEX  ($Bn per 1% move)")
     ax.legend(loc="best", fontsize=9)
-    ax.grid(True, axis="y", alpha=0.3)
+    ax.grid(True, axis="both", alpha=0.3, linestyle=":")
     fig.tight_layout()
     fig.savefig(outpath, dpi=120)
     plt.close(fig)
@@ -892,6 +914,9 @@ def parse_args(argv=None):
                         "Kept modest because Schwab 502s on very large chains (e.g. a full "
                         "year of SPX); raise it for more coverage at the risk of a 502.")
     p.add_argument("--out-prefix", default=None, help="output chart filename prefix.")
+    p.add_argument("--x-tick", type=float, default=10.0,
+                   help="chart x-axis tick/gridline spacing in price levels "
+                        "(auto-coarsened for high-priced underlyings).")
     p.add_argument("--no-plot", action="store_true", help="skip chart generation.")
     p.add_argument("--callback", default=os.environ.get("SCHWAB_CALLBACK_URL", DEFAULT_CALLBACK),
                    help="OAuth callback URL; must EXACTLY match your Schwab app config.")
@@ -980,7 +1005,7 @@ def run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
             safe = lbl.lower().replace(" ", "_")
             outpath = "{}_{}.png".format(prefix, safe)
             plot_profile(lbl, view, spot, view["flip_std"]["flip"], view["walls"],
-                         cfg.ticker, outpath)
+                         cfg.ticker, outpath, x_tick_step=args.x_tick)
             print("  chart saved: {}".format(outpath))
         print()
 
