@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Monthly GEX push: runs scripts/daily_gex.sh monthly on the 1st of every month at
+  07:55 CT (= 08:55 ET), regardless of weekday. "monthly" = --all-days 150 for
+  SPY + QQQ. (If the 1st is a weekend and the Mac is asleep, launchd runs it on the
+  next wake.)
+  Install:
+    cp scripts/com.brendanhan.gex-monthly.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-monthly.plist
+  Remove:
+    launchctl bootout gui/$(id -u)/com.brendanhan.gex-monthly
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brendanhan.gex-monthly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/scripts/daily_gex.sh</string>
+        <string>monthly</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Day</key><integer>1</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>55</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/logs/launchd.err.log</string>
+</dict>
+</plist>

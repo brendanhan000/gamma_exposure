@@ -137,39 +137,49 @@ $PY -m pytest test_gex.py               # run the test suite
 
 ---
 
-## Daily automation → your phone (macOS launchd)
+## Automation → your phone (macOS launchd)
 
-Runs the tool automatically **Mon–Fri at 07:45 CT (08:45 ET, ~45 min before the open)**
-and pushes the levels + chart to your iPhone. Files: `scripts/daily_gex.sh` (runs the
-tool + sends the push) and `scripts/com.brendanhan.gex-daily.plist` (the schedule).
+Pushes **SPY + QQQ** levels + charts to your iPhone on three cadences, each looking
+progressively further out. `scripts/daily_gex.sh <cadence>` does the run + push;
+one launchd plist per cadence schedules it:
+
+| Cadence | When (CT / ET) | Window | Plist |
+|---|---|---|---|
+| **daily**   | Mon–Fri 07:45 / 08:45 | `--all-days 45`  | `com.brendanhan.gex-daily.plist` |
+| **weekly**  | Monday 07:50 / 08:50  | `--all-days 90`  | `com.brendanhan.gex-weekly.plist` |
+| **monthly** | 1st of month 07:55    | `--all-days 150` | `com.brendanhan.gex-monthly.plist` |
+
+(Tickers/windows are overridable in `.env`: `GEX_TICKERS`, `GEX_{DAILY,WEEKLY,MONTHLY}_DAYS`,
+`GEX_SEND_CHARTS`.)
 
 **1. Pick a notifier** and add its keys to `.env` (see `.env.example`) — choose one:
-- **Pushover** — polished, sends the chart image: create an app at pushover.net →
-  set `PUSHOVER_TOKEN` + `PUSHOVER_USER`.
-- **Telegram** — free, private, sends the chart: make a bot via @BotFather →
-  set `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`.
+- **Pushover** — polished, sends the chart image: `PUSHOVER_TOKEN` + `PUSHOVER_USER`.
+- **Telegram** — free, private, sends the chart: `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`.
 - **ntfy.sh** — free, no account: install the ntfy app, subscribe to a hard-to-guess
   topic → set `NTFY_TOPIC`.
 
-**2. Test it once by hand:**
+**2. Test each cadence by hand:**
 ```bash
-bash scripts/daily_gex.sh
+bash scripts/daily_gex.sh daily      # or weekly / monthly
 tail -n 20 logs/daily_gex.log        # shows it ran + which notifier was used
 ```
 
-**3. Install the schedule:**
+**3. Install the schedules** (repeat the cp + bootstrap for each plist):
 ```bash
-cp scripts/com.brendanhan.gex-daily.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-daily.plist
-launchctl kickstart -k gui/$(id -u)/com.brendanhan.gex-daily   # optional: run once now
+for c in daily weekly monthly; do
+  cp scripts/com.brendanhan.gex-$c.plist ~/Library/LaunchAgents/
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-$c.plist
+done
 ```
-Remove with `launchctl bootout gui/$(id -u)/com.brendanhan.gex-daily`.
+Remove any with `launchctl bootout gui/$(id -u)/com.brendanhan.gex-<cadence>`.
 
 Notes:
-- The Mac must be **awake** at 07:45 CT (launchd runs a missed job on next wake; a
-  powered-off Mac skips it).
-- If a run **fails** (e.g. the weekly token expired), you still get a push titled
-  "RUN FAILED" — your cue to re-run `scripts/schwab_setup.py`.
+- The Mac must be **awake** at fire time (launchd runs a missed job on next wake; a
+  powered-off Mac skips it). Project must be under a folder `/bin/bash` has
+  **Full Disk Access** to (System Settings → Privacy & Security).
+- If a run **fails** (e.g. the weekly Schwab token expired), you still get a push
+  titled "RUN FAILED" — your cue to re-run `scripts/schwab_setup.py`.
+- On a Monday-the-1st all three fire (daily + weekly + monthly) — expected.
 - Market **holidays aren't skipped** — you'll just get the prior session's (stale) levels.
 
 ---

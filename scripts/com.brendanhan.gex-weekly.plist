@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Weekly GEX push: runs scripts/daily_gex.sh weekly every MONDAY at 07:50 CT
+  (= 08:50 ET). "weekly" = --all-days 90 for SPY + QQQ. Staggered 5 min after the
+  daily job so they don't hit Schwab at the exact same instant.
+  Install:
+    cp scripts/com.brendanhan.gex-weekly.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-weekly.plist
+  Remove:
+    launchctl bootout gui/$(id -u)/com.brendanhan.gex-weekly
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brendanhan.gex-weekly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/scripts/daily_gex.sh</string>
+        <string>weekly</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>50</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/logs/launchd.err.log</string>
+</dict>
+</plist>

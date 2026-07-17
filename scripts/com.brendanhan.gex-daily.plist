@@ -22,6 +22,7 @@
     <array>
         <string>/bin/bash</string>
         <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/scripts/daily_gex.sh</string>
+        <string>daily</string>
     </array>
 
     <key>StartCalendarInterval</key>
