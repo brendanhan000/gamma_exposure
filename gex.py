@@ -923,6 +923,8 @@ def parse_args(argv=None):
     p.add_argument("--token-path", default=None,
                    help="Schwab token file (default .schwab_token.json or $SCHWAB_TOKEN_PATH). "
                         "Create it with: python3 scripts/schwab_setup.py")
+    p.add_argument("--levels-only", action="store_true",
+                   help="print only a compact levels block (for notifications / quick pulls).")
     p.add_argument("--demo", action="store_true", help="run on an offline synthetic chain (no credentials).")
     return p.parse_args(argv)
 
@@ -964,38 +966,61 @@ def select_views(all_contracts, expiry_arg, today):
     return [("EXPIRY {}".format(expiry_arg), [c for c in all_contracts if c.expiry == d])]
 
 
+def render_levels_compact(label, view, spot, spy_ratio, cfg, today):
+    """Compact, stable levels block for --levels-only (notifications / quick pulls)."""
+    oi_date = prior_trading_session(today).isoformat()
+    if view.get("empty"):
+        print("{} | {}: no usable contracts (empty/thin chain).".format(cfg.ticker, label))
+        print()
+        return
+    flip = view["flip_std"]["flip"]
+    walls = view["walls"]
+    print("{} | {} | spot {:.2f} | OI {}".format(cfg.ticker, label, spot, oi_date))
+    print("  regime .... {}".format(regime_word(spot, flip)))
+    if flip is not None:
+        eq = cross_quote(cfg.ticker, flip, spy_ratio)
+        extra = "  ({} {:.2f})".format(eq[0], eq[1]) if eq else ""
+        print("  flip ...... {:.2f}{}".format(flip, extra))
+    else:
+        print("  flip ...... none in +/-{:.0%}".format(cfg.price_range))
+    print("  call wall . {}".format(fmt_px(walls["call_wall"])))
+    print("  put wall .. {}".format(fmt_px(walls["put_wall"])))
+    print("  net GEX ... {}".format(fmt_bn(view["total"])))
+    print()
+
+
 def run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
         dropped_expired, floored, rate_is_default):
     """Compute + print everything given an already-fetched/parsed chain."""
-    print_assumptions(cfg, rate_is_default)
-    print_data_health(spot, ts_ns, dropped, dropped_expired, floored,
-                       len(all_contracts), today, prior_trading_session(today))
-
     views_raw = select_views(all_contracts, args.expiry, today)
     computed = [(lbl, compute_view(cs, spot, cfg)) for lbl, cs in views_raw]
 
-    # #1 totals side by side
-    print_side_by_side(computed)
+    if args.levels_only:
+        for lbl, view in computed:
+            render_levels_compact(lbl, view, spot, spy_ratio, cfg, today)
+    else:
+        print_assumptions(cfg, rate_is_default)
+        print_data_health(spot, ts_ns, dropped, dropped_expired, floored,
+                           len(all_contracts), today, prior_trading_session(today))
+        print_side_by_side(computed)
 
-    # Fraction of gamma in 0DTE vs later (needs the all-expiries population)
-    if args.expiry is None:
-        all_view = dict(computed)["ALL EXPIRIES"]
-        zero_view = dict(computed)["0DTE"]
-        if not all_view.get("empty") and all_view["gross"] > 0:
-            frac = (0.0 if zero_view.get("empty") else zero_view["gross"]) / all_view["gross"]
-            print("-" * 78)
-            print("GAMMA CONCENTRATION")
-            print("-" * 78)
-            print("  0DTE gross gamma / all-expiry gross gamma = {:.1%}".format(frac))
-            print("  (remaining {:.1%} sits in later expiries)".format(1 - frac))
-            print()
+        # Fraction of gamma in 0DTE vs later (needs the all-expiries population)
+        if args.expiry is None:
+            all_view = dict(computed)["ALL EXPIRIES"]
+            zero_view = dict(computed)["0DTE"]
+            if not all_view.get("empty") and all_view["gross"] > 0:
+                frac = (0.0 if zero_view.get("empty") else zero_view["gross"]) / all_view["gross"]
+                print("-" * 78)
+                print("GAMMA CONCENTRATION")
+                print("-" * 78)
+                print("  0DTE gross gamma / all-expiry gross gamma = {:.1%}".format(frac))
+                print("  (remaining {:.1%} sits in later expiries)".format(1 - frac))
+                print()
 
-    # Detail + summary + plot per view
-    for lbl, view in computed:
-        print_view_detail(lbl, view, spot, spy_ratio, cfg)
-
-    for lbl, view in computed:
-        render_summary(lbl, view, spot, spy_ratio, cfg)
+        for lbl, view in computed:
+            print_view_detail(lbl, view, spot, spy_ratio, cfg)
+        for lbl, view in computed:
+            render_summary(lbl, view, spot, spy_ratio, cfg)
 
     if not args.no_plot:
         prefix = args.out_prefix or "gex_{}_{}".format(cfg.ticker.replace(":", ""), today.isoformat())

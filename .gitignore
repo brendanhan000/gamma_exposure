@@ -3,8 +3,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
-# Generated GEX charts (regenerable artifacts)
+# Generated GEX charts + run logs (regenerable artifacts)
 gex_*.png
+logs/
 
 # Secrets / OAuth tokens / env (NEVER commit)
 .schwab_token.json

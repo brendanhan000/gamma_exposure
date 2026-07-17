@@ -131,6 +131,43 @@ $PY -m pytest test_gex.py               # run the test suite
 
 ---
 
+## Daily automation → your phone (macOS launchd)
+
+Runs the tool automatically **Mon–Fri at 07:45 CT (08:45 ET, ~45 min before the open)**
+and pushes the levels + chart to your iPhone. Files: `scripts/daily_gex.sh` (runs the
+tool + sends the push) and `scripts/com.brendanhan.gex-daily.plist` (the schedule).
+
+**1. Pick a notifier** and add its keys to `.env` (see `.env.example`) — choose one:
+- **Pushover** — polished, sends the chart image: create an app at pushover.net →
+  set `PUSHOVER_TOKEN` + `PUSHOVER_USER`.
+- **Telegram** — free, private, sends the chart: make a bot via @BotFather →
+  set `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`.
+- **ntfy.sh** — free, no account: install the ntfy app, subscribe to a hard-to-guess
+  topic → set `NTFY_TOPIC`.
+
+**2. Test it once by hand:**
+```bash
+bash scripts/daily_gex.sh
+tail -n 20 logs/daily_gex.log        # shows it ran + which notifier was used
+```
+
+**3. Install the schedule:**
+```bash
+cp scripts/com.brendanhan.gex-daily.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-daily.plist
+launchctl kickstart -k gui/$(id -u)/com.brendanhan.gex-daily   # optional: run once now
+```
+Remove with `launchctl bootout gui/$(id -u)/com.brendanhan.gex-daily`.
+
+Notes:
+- The Mac must be **awake** at 07:45 CT (launchd runs a missed job on next wake; a
+  powered-off Mac skips it).
+- If a run **fails** (e.g. the weekly token expired), you still get a push titled
+  "RUN FAILED" — your cue to re-run `scripts/schwab_setup.py`.
+- Market **holidays aren't skipped** — you'll just get the prior session's (stale) levels.
+
+---
+
 ## Methodology (the part that matters)
 
 **1. BSM gamma** — identical for calls and puts, computed from Schwab's IV:

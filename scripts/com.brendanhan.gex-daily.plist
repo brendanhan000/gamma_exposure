@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent: runs scripts/daily_gex.sh Mon–Fri at 07:45 local time.
+  This Mac is on America/Chicago (CT), so 07:45 CT == 08:45 ET (45 min before the
+  09:30 ET open). CT and ET shift together for DST, so this stays 08:45 ET year-round.
+  If you move the Mac to a different timezone, adjust <Hour> to hit ~08:45 ET.
+
+  Install:
+    cp scripts/com.brendanhan.gex-daily.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-daily.plist
+    launchctl kickstart -k gui/$(id -u)/com.brendanhan.gex-daily   # optional: run once now
+  Remove:
+    launchctl bootout gui/$(id -u)/com.brendanhan.gex-daily
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brendanhan.gex-daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/scripts/daily_gex.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>45</integer></dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/logs/launchd.err.log</string>
+</dict>
+</plist>
