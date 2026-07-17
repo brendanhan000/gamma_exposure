@@ -28,6 +28,7 @@ from gex import (
     parse_schwab_chain,
     to_schwab_symbol,
     get_schwab_client,
+    cross_quote,
 )
 
 
@@ -41,6 +42,15 @@ def test_gamma_clean_atm_case():
     #   gamma = 0.39695255 / (100 * 0.2 * 1) = 0.0198476275
     g = float(compute_gamma_bsm(100.0, 100.0, 1.0, 0.2, r=0.0, q=0.0))
     assert g == pytest.approx(0.0198476275, abs=1e-9)
+
+
+def test_gamma_dividend_yield_discount():
+    # Merton gamma carries an explicit exp(-q*T) factor. Chosen so d1 = 0 exactly:
+    # S=K=100, T=1, sigma=0.2, r=0, q=0.02 -> (r - q + sigma^2/2) = 0 -> d1 = 0.
+    #   gamma = e^{-0.02} * phi(0) / (100 * 0.2),  phi(0) = 0.3989422804014327
+    expected = math.exp(-0.02) * 0.3989422804014327 / 20.0
+    g = float(compute_gamma_bsm(100.0, 100.0, 1.0, 0.2, r=0.0, q=0.02))
+    assert g == pytest.approx(expected, rel=1e-12)
 
 
 def test_gamma_hull_textbook_example():
@@ -165,6 +175,14 @@ def test_net_total_sign_flips_with_convention():
 # ---------------------------------------------------------------------------
 # Schwab data layer (the riskiest new code; no network touched)
 # ---------------------------------------------------------------------------
+def test_cross_quote_both_directions_and_none():
+    # SPX -> SPY divides by the ratio; SPY -> SPX multiplies; others: no cross-quote.
+    assert cross_quote("SPX", 5900.0, 10.0) == ("SPY", 590.0)
+    assert cross_quote("$SPX", 5900.0, 10.0) == ("SPY", 590.0)
+    assert cross_quote("SPY", 590.0, 10.0) == ("SPX", 5900.0)
+    assert cross_quote("QQQ", 500.0, 10.0) is None
+
+
 def test_to_schwab_symbol():
     assert to_schwab_symbol("SPX") == "$SPX"
     assert to_schwab_symbol("spx") == "$SPX"

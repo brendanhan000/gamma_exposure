@@ -13,9 +13,9 @@ finds the call/put walls, and prints a plain-text bias summary plus a chart.
 METHODOLOGY AND ASSUMPTIONS  (made explicit here, in-code, and in the output)
 ============================================================================
 
-(1) BSM GAMMA  -- identical for calls and puts:
+(1) BSM (Merton) GAMMA  -- identical for calls and puts:
 
-        gamma = phi(d1) / (S * sigma * sqrt(T))
+        gamma = exp(-q*T) * phi(d1) / (S * sigma * sqrt(T))
         d1    = [ ln(S/K) + (r - q + 0.5*sigma^2) * T ] / (sigma * sqrt(T))
 
     where phi is the standard-normal PDF, S=spot, K=strike, sigma=implied vol
@@ -81,11 +81,16 @@ Setup (one time):
     python3 scripts/schwab_setup.py                    # schwab-py OAuth login + verify
 
 Usage:
-    python3 gex.py                 # 0DTE + all expiries, SPX (=$SPX)
+    python3 gex.py                 # 0DTE + all expiries, SPY (default)
     python3 gex.py --expiry 0dte
     python3 gex.py --expiry 2026-06-19 --rate 0.043
-    python3 gex.py --ticker SPY    # SPY ETF options proxy (no index entitlement)
+    python3 gex.py --ticker QQQ    # any optionable ETF/equity with listed OI
     python3 gex.py --demo          # offline synthetic chain, no credentials
+
+NOTE: the default ticker is SPY (not SPX) because Schwab returns zero open
+interest for cash-index ($SPX) options -- index GEX is impossible on this
+source; SPY is the standard proxy and levels cross-quote to SPX via the live
+SPX/SPY ratio.
 """
 from __future__ import annotations
 
@@ -113,8 +118,11 @@ from scipy.stats import norm
 DEFAULT_CALLBACK   = "https://127.0.0.1:8182"   # must EXACTLY match your Schwab app's callback
 DEFAULT_TOKEN_PATH = ".schwab_token.json"        # project-local token file (git-ignored)
 
-DEFAULT_TICKER       = "SPX"
-DEFAULT_MULTIPLIER   = 100        # SPX/SPXW index-option contract multiplier
+DEFAULT_TICKER       = "SPY"      # SPY, not SPX: Schwab returns ZERO open interest
+                                  # for cash-index ($SPX) options, and GEX is
+                                  # OI-weighted -- SPX GEX is impossible on this
+                                  # source. SPY is the standard dealer-gamma proxy.
+DEFAULT_MULTIPLIER   = 100        # standard equity/ETF & index option multiplier
 DEFAULT_RATE         = 0.043      # risk-free, ~3M T-bill ballpark; OVERRIDE with --rate
 DEFAULT_DIV_YIELD     = 0.0       # SPX really ~1.3%; default 0 (see methodology)
 DEFAULT_PRICE_RANGE   = 0.05      # +/-5% repricing window for the flip search
@@ -172,7 +180,14 @@ class Config:
 # Black-Scholes-Merton gamma
 # ===========================================================================
 def compute_gamma_bsm(S, K, T, sigma, r=DEFAULT_RATE, q=0.0):
-    """BSM gamma = phi(d1) / (S*sigma*sqrt(T)). Identical for calls and puts.
+    """Merton (dividend-adjusted BSM) gamma. Identical for calls and puts:
+
+        gamma = exp(-q*T) * phi(d1) / (S * sigma * sqrt(T))
+        d1    = [ ln(S/K) + (r - q + sigma^2/2) * T ] / (sigma * sqrt(T))
+
+    The exp(-q*T) factor is part of the closed form (Hull Ch. 19); omitting it
+    overstates gamma by ~q*T when a dividend yield is supplied. With q=0 it
+    reduces to the classic BSM gamma.
 
     Fully vectorized: S, K, T, sigma may be scalars or broadcastable arrays.
     Returns 0 wherever an input is non-positive / undefined (T<=0, sigma<=0,
@@ -187,7 +202,7 @@ def compute_gamma_bsm(S, K, T, sigma, r=DEFAULT_RATE, q=0.0):
     with np.errstate(divide="ignore", invalid="ignore"):
         vol_t = sigma * np.sqrt(T)
         d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / vol_t
-        gamma = norm.pdf(d1) / (S * vol_t)
+        gamma = np.exp(-q * T) * norm.pdf(d1) / (S * vol_t)
     return np.where(valid, gamma, 0.0)
 
 
@@ -488,8 +503,9 @@ def parse_schwab_chain(data):
                     except (TypeError, ValueError):
                         dropped["no_iv"] += 1
                         continue
-                    # -999.0 is Schwab's "no IV" sentinel; also guard NaN/inf/<=0.
-                    if not math.isfinite(ivf) or ivf <= 0 or ivf <= -998.0:
+                    # Guard NaN/inf and non-positive IV; Schwab's "no IV"
+                    # sentinel (-999.0) is caught by the <= 0 test.
+                    if not math.isfinite(ivf) or ivf <= 0:
                         dropped["no_iv"] += 1
                         continue
                     contracts.append(Contract(strike, exp_date, cp,
@@ -497,15 +513,25 @@ def parse_schwab_chain(data):
     return contracts, spot, ts_ns, dropped, status
 
 
-def fetch_spy_ratio_schwab(client, spx_spot):
-    """Live SPX/SPY ratio from a Schwab SPY quote. Returns (ratio, spy_px, source)."""
+def fetch_spx_spy_ratio(client, base_ticker, spot):
+    """Live SPX/SPY ratio, runnable from EITHER leg of the pair.
+
+    base_ticker is the underlying we're analyzing ('SPX' or 'SPY') and `spot` its
+    price from the chain; the other leg is fetched with one Schwab quote call.
+    Verified response shape: {"<symbol>": {"quote": {"lastPrice": ...}}}; index
+    quotes ($SPX) populate lastPrice/closePrice but may leave mark None, hence
+    the fallback order. Returns (spx_over_spy_ratio, other_leg_px, source_label).
+    """
+    other = "SPY" if base_ticker == "SPX" else "$SPX"
     try:
-        resp = client.get_quote("SPY")
+        resp = client.get_quote(other)
         resp.raise_for_status()
-        q = ((resp.json().get("SPY") or {}).get("quote")) or {}
-        spy = q.get("lastPrice") or q.get("mark") or q.get("closePrice")
-        if spy:
-            return spx_spot / float(spy), float(spy), "Schwab SPY quote"
+        q = ((resp.json().get(other) or {}).get("quote")) or {}
+        px = q.get("lastPrice") or q.get("mark") or q.get("closePrice")
+        if px:
+            px = float(px)
+            ratio = (spot / px) if base_ticker == "SPX" else (px / spot)
+            return ratio, px, "live Schwab {} quote".format(other)
     except Exception:
         pass
     return SPY_RATIO_FALLBACK, None, "fallback (hardcoded ~10, NOT live)"
@@ -609,7 +635,7 @@ def print_assumptions(cfg, rate_is_default):
           .format(cfg.convention.call_sign, cfg.convention.put_sign))
     print("  Risk-free rate r .... {:.4f}{}".format(
         cfg.rate, "   <-- DEFAULT; set --rate to your current value" if rate_is_default else ""))
-    print("  Dividend yield q .... {:.4f}   (SPX really ~0.013; default 0 -> set --div-yield)"
+    print("  Dividend yield q .... {:.4f}   (SPY ~0.012, QQQ ~0.006; default 0 -> set --div-yield)"
           .format(cfg.div_yield))
     print("  Multiplier .......... {}".format(cfg.multiplier))
     print("  Day count ........... ACT/{:.0f}, time-to-expiry to {:02d}:00 ET (PM settle)"
@@ -897,7 +923,9 @@ def parse_args(argv=None):
         description="Dealer gamma exposure (GEX) and gamma-flip estimator (SPX 0DTE bias).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--ticker", default=DEFAULT_TICKER,
-                   help="underlying (SPX -> $SPX automatically; pass SPY for the ETF).")
+                   help="underlying (default SPY). NOTE: Schwab has no open interest for "
+                        "cash indices ($SPX etc.), so index GEX is impossible here -- use "
+                        "the ETF (SPY/QQQ).")
     p.add_argument("--expiry", default=None,
                    help="'0dte' | 'all' | YYYY-MM-DD. Default: compute BOTH 0DTE and all expiries.")
     p.add_argument("--rate", type=float, default=DEFAULT_RATE, help="risk-free rate (annual, decimal).")
@@ -975,12 +1003,12 @@ def render_levels_compact(label, view, spot, spy_ratio, cfg, today):
         return
     flip = view["flip_std"]["flip"]
     walls = view["walls"]
-    print("{} | {} | spot {:.2f} | OI {}".format(cfg.ticker, label, spot, oi_date))
+    print("{} | {} | spot {} | OI {}".format(cfg.ticker, label, fmt_px(spot), oi_date))
     print("  regime .... {}".format(regime_word(spot, flip)))
     if flip is not None:
         eq = cross_quote(cfg.ticker, flip, spy_ratio)
-        extra = "  ({} {:.2f})".format(eq[0], eq[1]) if eq else ""
-        print("  flip ...... {:.2f}{}".format(flip, extra))
+        extra = "  ({} {})".format(eq[0], fmt_px(eq[1])) if eq else ""
+        print("  flip ...... {}{}".format(fmt_px(flip), extra))
     else:
         print("  flip ...... none in +/-{:.0%}".format(cfg.price_range))
     print("  call wall . {}".format(fmt_px(walls["call_wall"])))
@@ -1048,9 +1076,20 @@ def main(argv=None):
 
     today = now_et().date()
 
+    # Validate --expiry up front so BOTH the demo and live paths reject garbage
+    # cleanly instead of tracebacking later in select_views().
+    if args.expiry and args.expiry.lower() not in ("0dte", "all"):
+        try:
+            date.fromisoformat(args.expiry)
+        except ValueError:
+            print("ERROR: --expiry must be '0dte', 'all', or YYYY-MM-DD.", file=sys.stderr)
+            return 2
+
     if args.demo:
         print(">>> DEMO MODE: synthetic offline chain, NOT live data. <<<\n")
-        spot = 5900.0
+        # Ticker-appropriate synthetic spot so labels/cross-quotes stay sane.
+        spot = {"SPX": 5900.0, "SPY": 590.0, "QQQ": 500.0}.get(
+            cfg.ticker.upper().lstrip("$"), 1000.0)
         # Use a representative mid-session timestamp so the synthetic 0DTE bucket
         # is populated no matter what wall-clock time the demo is run at (after the
         # 16:00 ET close, real 0DTE has expired and would correctly be empty).
@@ -1094,11 +1133,7 @@ def main(argv=None):
     elif args.expiry and args.expiry.lower() == "all":
         from_date, to_date = today, today + timedelta(days=args.all_days)
     elif args.expiry:
-        try:
-            from_date = to_date = date.fromisoformat(args.expiry)
-        except ValueError:
-            print("ERROR: --expiry must be '0dte', 'all', or YYYY-MM-DD.", file=sys.stderr)
-            return 2
+        from_date = to_date = date.fromisoformat(args.expiry)  # validated above
     else:  # default: both 0DTE and all -> fetch the full near-dated window
         from_date, to_date = today, today + timedelta(days=args.all_days)
 
@@ -1139,11 +1174,16 @@ def main(argv=None):
                 print("  NOTE: all strikes showed 0 open interest. OI is an overnight (OCC) "
                       "figure; before the morning post it may not be available yet.")
 
+    # SPX<->SPY cross-quote ratio: fetched live when running either leg of the
+    # pair; meaningless for other tickers (QQQ, ...), where no ratio is printed
+    # and no cross-quote appears in the output.
+    base = cfg.ticker.upper().lstrip("$")
     spy_ratio = SPY_RATIO_FALLBACK
-    ratio_src = "fallback"
-    if symbol in ("$SPX", "$SPX.X"):
-        spy_ratio, spy_px, ratio_src = fetch_spy_ratio_schwab(client, spot)
-    print("  SPX/SPY ratio: {:.3f} ({})\n".format(spy_ratio, ratio_src))
+    if base in ("SPX", "SPY"):
+        spy_ratio, other_px, ratio_src = fetch_spx_spy_ratio(client, base, spot)
+        print("  SPX/SPY ratio: {:.3f} ({})\n".format(spy_ratio, ratio_src))
+    else:
+        print()
 
     run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
         dropped_expired, floored, rate_is_default)

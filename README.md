@@ -1,10 +1,16 @@
-# SPX Dealer Gamma Exposure (GEX) & Gamma-Flip Tool
+# Dealer Gamma Exposure (GEX) & Gamma-Flip Tool
 
 A single, auditable Python script (`gex.py`) that estimates **dealer gamma
-exposure** and the **gamma-flip (zero-gamma) level** for SPX, to set a daily
-0DTE trading bias. It pulls the full options-chain snapshot from the **Charles
-Schwab Trader API**, **recomputes gamma itself with Black-Scholes-Merton** (it does
-*not* trust the vendor greeks), and prints a plain-text bias summary plus a per-strike chart.
+exposure** and the **gamma-flip (zero-gamma) level** for SPY/QQQ (and any
+optionable underlying with listed OI), to set a daily 0DTE trading bias. It pulls
+the full options-chain snapshot from the **Charles Schwab Trader API**,
+**recomputes gamma itself with Black-Scholes-Merton** (it does *not* trust the
+vendor greeks), and prints a plain-text bias summary plus a per-strike chart.
+
+> **Why SPY and not SPX?** Schwab returns **zero open interest for cash-index
+> ($SPX) options**, and GEX is OI-weighted — so index GEX is impossible on this
+> data source. SPY is the standard dealer-gamma proxy; SPY levels are
+> cross-quoted to SPX using the live SPX/SPY ratio.
 
 Built to prioritize **correctness and auditability over features**: every
 modeling assumption is written in code comments *and* printed at runtime.
@@ -64,8 +70,8 @@ python3 gex.py --ticker SPY          # SPY ETF options proxy
 python3 gex.py --demo                # offline synthetic chain (no credentials)
 ```
 
-Useful flags: `--ticker` (default SPX → `$SPX`, but **Schwab returns no OI for
-`$SPX`** — use `SPY`/`QQQ`), `--all-days` (window for `all`/default, default 45),
+Useful flags: `--ticker` (default **SPY**; `$SPX` has no OI on Schwab, so use
+ETFs), `--all-days` (window for `all`/default, default 45),
 `--x-tick` (chart gridline spacing, default 10), `--multiplier` (100),
 `--price-range` (±5% flip-search window), `--steps` (grid resolution),
 `--call-sign`/`--put-sign` (raw sign overrides), `--no-plot`, `--out-prefix`,
@@ -170,12 +176,15 @@ Notes:
 
 ## Methodology (the part that matters)
 
-**1. BSM gamma** — identical for calls and puts, computed from Schwab's IV:
+**1. BSM (Merton) gamma** — identical for calls and puts, computed from Schwab's IV:
 
 ```
-gamma = phi(d1) / (S * sigma * sqrt(T))
+gamma = exp(-q*T) * phi(d1) / (S * sigma * sqrt(T))
 d1    = [ ln(S/K) + (r - q + 0.5*sigma^2) * T ] / (sigma * sqrt(T))
 ```
+
+(The `exp(-q*T)` dividend discount is part of the closed form; with the default
+`q=0` it reduces to classic BSM.)
 
 `S`=spot, `K`=strike, `sigma`=implied vol (Schwab IV), `T`=time-to-expiry in
 years (ACT/365, to **16:00 ET** on the expiry — SPXW is PM-settled), `r`=risk-free

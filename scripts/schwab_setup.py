@@ -90,6 +90,12 @@ def main(argv=None) -> int:
         print("[warn] unexpected response -- check entitlement (app 'Ready For Use' with "
               "Market Data Production) and the symbol.", file=sys.stderr)
         return 1
+    if not contracts:
+        # Auth + data path work, but nothing had usable OI+IV. For cash indices
+        # ($SPX) Schwab always returns zero OI, so this is expected there.
+        print("[warn] auth OK but the sample had 0 contracts with usable OI+IV. "
+              "Cash indices ($SPX) have no OI on Schwab -- verify with an ETF, "
+              "e.g. --ticker SPY.", file=sys.stderr)
 
     print("\n[done] You can now run:  python3 gex.py")
     return 0
