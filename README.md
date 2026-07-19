@@ -73,7 +73,7 @@ python3 gex.py --demo                # offline synthetic chain (no credentials)
 Useful flags: `--ticker` (default **SPY**; `$SPX` has no OI on Schwab, so use
 ETFs), `--all-days` (window for `all`/default, default 45),
 `--x-tick` (chart gridline spacing, default 10), `--multiplier` (100),
-`--price-range` (±5% flip-search window), `--steps` (grid resolution),
+`--price-range` (±10% flip-search window), `--steps` (grid resolution),
 `--call-sign`/`--put-sign` (raw sign overrides), `--no-plot`, `--out-prefix`,
 `--callback`, `--token-path`. See `python3 gex.py --help`.
 
@@ -196,10 +196,25 @@ d1    = [ ln(S/K) + (r - q + 0.5*sigma^2) * T ] / (sigma * sqrt(T))
 (The `exp(-q*T)` dividend discount is part of the closed form; with the default
 `q=0` it reduces to classic BSM.)
 
-`S`=spot, `K`=strike, `sigma`=implied vol (Schwab IV), `T`=time-to-expiry in
-years (ACT/365, to **16:00 ET** on the expiry — SPXW is PM-settled), `r`=risk-free
-(`--rate`), `q`=dividend yield (`--div-yield`). `T` is floored at 5 minutes so
-at-the-money 0DTE gamma stays finite near the close.
+`S`=spot, `K`=strike, `sigma`=**per-strike** implied vol (Schwab IV — the smile is
+never flattened to a single ATM vol; flattening destroys wing gamma and is the
+most common silent GEX bug), `T`=time-to-expiry in years (**calendar** ACT/365 to
+**16:00 ET** — deliberately matched to the vendor IV's clock; pairing vendor sigma
+with a trading-time `390×252` clock would break the `sigma²·T` total-variance
+pairing and inflate 0DTE gamma severalfold), `r`=risk-free (`--rate`),
+`q`=dividend yield (auto per-ticker: SPY 1.2%, QQQ 0.6%; override `--div-yield`).
+`T` is floored at 5 minutes so ATM 0DTE gamma stays finite near the close.
+
+Exercise style: European (BSM) gamma is used for **all** contracts. SPY/QQQ are
+American; the early-exercise premium is ignored — it concentrates in deep-ITM
+(low-gamma) strikes and is small for the short-dated flow that dominates GEX.
+
+**Quote filters** ("garbage IV → garbage gamma"): crossed quotes (bid > ask) are
+dropped anywhere; **deep-ITM** contracts (>5% in the money) with **no bid** or a
+**relative spread > 25%** are dropped — their IV is extracted from a sliver of
+extrinsic value and is noise. Deep-**OTM** wings are *never* quote-filtered
+(zero-bid wings still carry real tail gamma via the ask-side IV). Zero-OI strikes
+are always dropped. All drop counts are printed.
 
 **2. Dollar GEX per contract** — "dollar gamma per 1% move":
 
@@ -208,6 +223,10 @@ GEX = gamma * open_interest * multiplier * S^2 * 0.01
 ```
 
 = the dollar change in the aggregate (delta) position for a +1% move in spot.
+
+> **Unit warning:** this is the **per-1%** convention. Per-**point** GEX =
+> `gamma·OI·mult·S` (= per-1% ÷ `0.01·S`). SqueezeMetrics' published series is
+> per-point; most retail charts are per-1%. Comparing them raw is a category error.
 
 **3. Dealer sign convention — the model's single biggest assumption, not a fact.**
 Default = *standard*: dealers **long call gamma (+)**, **short put gamma (−)**:
@@ -219,9 +238,13 @@ net GEX = SUM_calls(GEX) - SUM_puts(GEX)
 Flippable via `--convention flipped` or `--call-sign/--put-sign`.
 
 **4. Gamma flip / zero-gamma level.** Total net GEX is **repriced across a grid of
-hypothetical spot prices** (±5% by default), recomputing gamma *and* the `S^2`
-term at each. The flip is where the total crosses zero (crossing nearest spot).
-Reported in SPX and SPY-equivalent (live SPX/SPY ratio; fallback ~10).
+hypothetical spot prices** (±10% by default), recomputing gamma *and* the `S^2`
+term at each. The flip is where the total crosses zero; the curve can have
+**multiple crossings** — all are detected, the one nearest spot is reported and
+the rest are listed. Reported in SPX and SPY-equivalent (live SPX/SPY ratio).
+Repricing holds each strike's IV fixed (**sticky-strike**); reality sits between
+sticky-strike and sticky-delta, so the flip is an estimate under a stated
+vol-dynamics assumption, not a model-free level.
 
 **5. Walls.** Call wall = strike with the largest **positive** net GEX (pin /
 resistance). Put wall = strike with the largest **negative** net GEX (support
@@ -251,9 +274,29 @@ mean-reverting). `spot < flip` → net **short gamma** (vol-amplifying, trend-pr
 - **OI staleness.** Open interest updates only once per day (overnight, OCC EOD).
   The tool prints the reference date and a clear caveat that **0DTE GEX lags**
   intraday positioning (today's freshly-opened 0DTE flow is *not* in this OI).
-- **Gamma concentration.** Reports the fraction of total gamma in 0DTE vs later.
-- **Thin/missing data.** Contracts with no OI or no IV are dropped (counts
-  reported); expired contracts are dropped; it never crashes on a sparse chain.
+- **Gamma by expiry (hedging urgency).** The all-expiry total is decomposed into
+  0DTE / ≤1 week / ≤ monthly OpEx / beyond, with gross share and net GEX per
+  bucket — so you can see how much of the headline number is slow OI.
+- **Thin/missing data.** Contracts with no OI, no IV, crossed quotes, or
+  deep-ITM garbage quotes are dropped (counts reported); expired contracts are
+  dropped; it never crashes on a sparse chain.
+
+## The governing rule: match the expiry set to your holding period
+
+This is the discipline almost nobody applies. GEX from the wrong expiry set is
+noise for your horizon:
+
+| Your horizon | Use | Reality check |
+|---|---|---|
+| **Intraday / 0DTE** | `--expiry 0dte` | **Prior-close OI is stale for 0DTE** — those positions open and close intraday; real-time signed volume (not available here) is what actually drives it. 0DTE gamma is enormous and **evaporates at 16:00 ET daily**. |
+| **Daily swing** | default (45d all-expiry) | Use as a **regime classifier, not an entry trigger**. |
+| **Weekly/monthly** | weekly push (90d) | **Monthly OpEx (3rd Friday) holds the bulk of index OI.** Charm/vanna dominate into roll-off — not modeled here. Watch levels reset after OpEx. |
+| **Quarterly** | monthly push (150d) | **Triple witching** (Mar/Jun/Sep/Dec) = the biggest structural resets. |
+| **Longer** | — | LEAPS gamma per contract is negligible; **vanna carries** — a gamma tool is the wrong lens. |
+
+If you day-trade off an all-expirations chart, part of that number is 6-month OI
+that will **not** be rebalanced today — that's exactly what the GAMMA BY EXPIRY
+table decomposes. Weight by hedging urgency, not magnitude alone.
 
 ## Limitations (read before trading on this)
 
@@ -261,8 +304,18 @@ mean-reverting). `spot < flip` → net **short gamma** (vol-amplifying, trend-pr
   depends on it. This is the biggest weakness — treat the regime as directional
   context, not a precise tradeable level.
 - OI is end-of-prior-session; the intraday 0DTE picture is necessarily stale.
-- Uses Schwab's IV as the input vol; garbage IV in → garbage gamma out.
-- `q=0` by default (SPX really yields ~1.3%); pass `--div-yield` to include it.
+- **Single-underlying scope.** A full S&P-complex dealer book aggregates
+  SPX + SPXW + XSP + SPY + ES normalized to common notional. Schwab has no index
+  OI and no futures options, so this tool measures **one listed underlying's**
+  gamma (SPY or QQQ) — a correlated *proxy* for the complex, not its total.
+  Raw GEX is deliberately never summed across underlyings.
+- Uses Schwab's per-strike IV as input; quote filters catch the worst garbage,
+  but garbage IV in → garbage gamma out still applies.
+- Sticky-strike repricing and European-exercise gamma are stated approximations.
+- Dealer-direction data (e.g. CBOE open-close) is not available via Schwab, so
+  the sign convention stays an assumption with a sensitivity band.
+- `q` auto-fills from a built-in per-ticker map (SPY 1.2%, QQQ 0.6%); pass
+  `--div-yield` for precision (e.g. around special distributions).
 - Schwab OAuth needs a one-time browser login and an **approved** developer app
   (approval can take days); `schwab-py` auto-refreshes the ~30-min access token,
   but the ~7-day refresh token requires re-running `scripts/schwab_setup.py`.

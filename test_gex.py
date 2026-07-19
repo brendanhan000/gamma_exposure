@@ -29,6 +29,10 @@ from gex import (
     to_schwab_symbol,
     get_schwab_client,
     cross_quote,
+    parse_args,
+    build_config,
+    third_friday,
+    next_monthly_opex,
 )
 
 
@@ -239,6 +243,54 @@ def test_parse_schwab_chain_empty_is_graceful():
     assert contracts == []
     assert spot == 100.0
     assert ts_ns is None
+
+
+def test_quote_filters_crossed_and_deep_itm():
+    # spot=100. Deep ITM = >5% in the money (calls K<95, puts K>105).
+    data = {
+        "status": "SUCCESS",
+        "underlyingPrice": 100.0,
+        "callExpDateMap": {
+            "2027-01-15:180": {
+                "90.0":  [{"putCall": "CALL", "strikePrice": 90.0, "openInterest": 100,
+                           "volatility": 20.0, "bid": 0.0, "ask": 12.0}],   # deep ITM, no bid -> drop
+                "100.0": [{"putCall": "CALL", "strikePrice": 100.0, "openInterest": 100,
+                           "volatility": 20.0, "bid": 5.2, "ask": 5.0}],    # crossed -> drop
+                "98.0":  [{"putCall": "CALL", "strikePrice": 98.0, "openInterest": 100,
+                           "volatility": 20.0, "bid": 3.0, "ask": 3.2}],    # clean -> keep
+            }
+        },
+        "putExpDateMap": {
+            "2027-01-15:180": {
+                "112.0": [{"putCall": "PUT", "strikePrice": 112.0, "openInterest": 100,
+                           "volatility": 20.0, "bid": 11.0, "ask": 20.0}],  # deep ITM, spread 58% -> drop
+                "80.0":  [{"putCall": "PUT", "strikePrice": 80.0, "openInterest": 100,
+                           "volatility": 30.0, "bid": 0.0, "ask": 0.5}],    # deep OTM zero-bid WING -> KEPT
+            }
+        },
+    }
+    contracts, spot, ts_ns, dropped, status = parse_schwab_chain(data)
+    assert dropped["itm_bad_quote"] == 2      # ITM call no-bid + ITM put wide spread
+    assert dropped["crossed"] == 1
+    kept = {(c.cp, c.strike) for c in contracts}
+    assert kept == {("call", 98.0), ("put", 80.0)}   # wing gamma preserved
+
+
+def test_div_yield_per_ticker_map():
+    # "Get dividends and rates right": q auto-resolves per ticker unless overridden.
+    assert build_config(parse_args([])).div_yield == pytest.approx(0.012)               # SPY default
+    assert build_config(parse_args(["--ticker", "QQQ"])).div_yield == pytest.approx(0.006)
+    assert build_config(parse_args(["--ticker", "XYZ"])).div_yield == 0.0               # unknown -> 0
+    assert build_config(parse_args(["--div-yield", "0.0"])).div_yield == 0.0            # flag wins
+    assert build_config(parse_args(["--ticker", "QQQ", "--div-yield", "0.01"])).div_yield == 0.01
+
+
+def test_monthly_opex_calendar():
+    assert third_friday(2026, 7) == date(2026, 7, 17)
+    assert third_friday(2026, 8) == date(2026, 8, 21)
+    assert next_monthly_opex(date(2026, 7, 17)) == date(2026, 7, 17)   # OpEx day itself
+    assert next_monthly_opex(date(2026, 7, 18)) == date(2026, 8, 21)   # after -> next month
+    assert next_monthly_opex(date(2026, 12, 20)) == date(2027, 1, 15)  # year rollover
 
 
 def test_get_schwab_client_errors_without_creds_or_token(tmp_path):

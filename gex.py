@@ -23,10 +23,23 @@ METHODOLOGY AND ASSUMPTIONS  (made explicit here, in-code, and in the output)
     rate (--rate), q=dividend yield (--div-yield).
 
     * We compute gamma OURSELVES; the vendor's own gamma/greeks fields are ignored.
-    * T is measured in CALENDAR time (ACT/365) to 16:00 US/Eastern on the
-      expiration date -- SPXW 0DTE / PM-settled contracts settle at the cash
-      close. As T -> 0 the at-the-money gamma explodes (gamma ~ 1/sqrt(T)); we
-      floor T at T_FLOOR_SECONDS and warn when the floor binds.
+    * PER-STRIKE IV: every contract is priced with its OWN vendor IV -- the smile
+      is never flattened to a single ATM vol (flattening destroys wing gamma and
+      is the most common silent GEX bug).
+    * EXERCISE STYLE: gamma is the European (Black-Scholes-Merton) closed form for
+      ALL contracts. SPY/QQQ options are American; the early-exercise premium is
+      ignored. The difference concentrates in deep-ITM (low-gamma) strikes and is
+      small for the short-dated/near-the-money strikes that dominate GEX, but it
+      is an approximation, not an oversight.
+    * CLOCK CONSISTENCY: T is CALENDAR time (ACT/365) to 16:00 US/Eastern (PM
+      settle at the cash close), NOT trading time (390x252). This is deliberate:
+      the input IVs are vendor quotes annualized on a calendar clock, and gamma
+      only needs the total variance sigma^2*T to be internally consistent.
+      Pairing vendor sigma with a trading-time T would break that pairing and
+      inflate 0DTE gamma severalfold; a trading-time clock is only correct when
+      IV is re-derived from prices under the same clock.
+    * As T -> 0 the at-the-money gamma explodes (gamma ~ 1/sqrt(T)); we floor T
+      at T_FLOOR_SECONDS and warn when the floor binds.
     * q defaults to 0.0 so the DEFAULT inputs are exactly the five quantities in
       the brief (S, K, T, sigma, r). SPX really yields ~1.3%; pass --div-yield
       to include it. The effect on gamma is tiny for short tenors.
@@ -38,6 +51,10 @@ METHODOLOGY AND ASSUMPTIONS  (made explicit here, in-code, and in the output)
     Interpretation: the dollar change in the aggregate (delta) position for a
     +1% move in the underlying. (gamma*S*0.01 = delta change per 1% move per
     share; * S * multiplier * OI converts that to dollars across the OI.)
+
+    UNIT WARNING: this is the PER-1% convention. The per-POINT convention is
+    gamma*OI*mult*S (= this / (0.01*S)); SqueezeMetrics' published series is
+    per-point. Comparing per-1% numbers to per-point numbers is a category error.
 
 (3) DEALER SIGN CONVENTION  -- the model's single biggest weakness, NOT a fact.
 
@@ -57,10 +74,16 @@ METHODOLOGY AND ASSUMPTIONS  (made explicit here, in-code, and in the output)
 (4) GAMMA FLIP / ZERO-GAMMA LEVEL:
 
     Reprice the TOTAL net GEX across a fine grid of hypothetical spot prices
-    (default +/-5%). At each hypothetical spot we recompute gamma for every
+    (default +/-10%). At each hypothetical spot we recompute gamma for every
     contract (and the S^2 term) holding K, T, sigma, OI fixed, then sum. The
     flip level is where that total crosses zero; we report the crossing nearest
-    to the current spot (and flag if there are several / none).
+    to the current spot (and flag if there are several / none -- the curve can
+    legitimately have multiple zero crossings).
+
+    STICKY-STRIKE CAVEAT: holding each contract's IV fixed while S moves is the
+    sticky-strike assumption. Reality sits between sticky-strike and
+    sticky-delta (the smile follows moneyness as spot moves), so the flip is an
+    estimate under a stated vol-dynamics assumption, not a model-free level.
 
 (5) WALLS:
     Call wall  = strike with the largest POSITIVE net GEX (pin / resistance).
@@ -71,10 +94,21 @@ METHODOLOGY AND ASSUMPTIONS  (made explicit here, in-code, and in the output)
     spot > flip  -> dealers net LONG gamma  -> vol-dampening / mean-reverting.
     spot < flip  -> dealers net SHORT gamma -> vol-amplifying / trend-prone.
 
+SCOPE (single-underlying, NOT the full SPX complex): a complete dealer-gamma
+picture for the S&P complex would aggregate SPX + SPXW + XSP + SPY + ES options
+normalized to a common notional. That is impossible on this data source: Schwab
+returns no open interest for cash-index options ($SPX/XSP) and no futures
+options (ES). This tool therefore measures the gamma of ONE listed underlying
+(SPY or QQQ) -- a liquid, correlated PROXY for the complex, not its total.
+Levels are in the traded underlying's own terms; magnitudes understate the
+full-complex dealer book. Summing raw GEX across underlyings without notional
+normalization would be meaningless and is deliberately not offered.
+
 CAVEATS BUILT INTO THE OUTPUT: OI is end-of-prior-session (it updates overnight),
 so the 0DTE GEX *lags* intraday positioning; the dealer sign convention is an
-assumption; thin early-morning chains are handled by dropping contracts with no
-OI / no IV and reporting the counts.
+assumption (dealer-direction data like CBOE open-close is not available here);
+thin early-morning chains are handled by dropping contracts with no OI / no IV
+(and crossed quotes) and reporting the counts.
 
 Setup (one time):
     export SCHWAB_APP_KEY=...  SCHWAB_APP_SECRET=...   # from developer.schwab.com
@@ -123,8 +157,24 @@ DEFAULT_TICKER       = "SPY"      # SPY, not SPX: Schwab returns ZERO open inter
                                   # source. SPY is the standard dealer-gamma proxy.
 DEFAULT_MULTIPLIER   = 100        # standard equity/ETF & index option multiplier
 DEFAULT_RATE         = 0.043      # risk-free, ~3M T-bill ballpark; OVERRIDE with --rate
-DEFAULT_DIV_YIELD     = 0.0       # SPX really ~1.3%; default 0 (see methodology)
-DEFAULT_PRICE_RANGE   = 0.05      # +/-5% repricing window for the flip search
+DEFAULT_DIV_YIELD     = 0.0       # generic fallback; per-ticker map below applies when known
+DEFAULT_PRICE_RANGE   = 0.10      # +/-10% repricing window for the flip search (a deep
+                                  # short-gamma day can push the flip well past +/-5%)
+
+# Approximate trailing dividend yields, applied when --div-yield is NOT passed.
+# "Get dividends right": q enters d1 and the exp(-q*T) gamma discount. Values are
+# ballpark and printed at runtime; override with --div-yield for precision.
+TICKER_DIV_YIELDS = {"SPY": 0.012, "QQQ": 0.006, "SPX": 0.013, "IWM": 0.011, "DIA": 0.017}
+
+# Quote-quality filters ("garbage IV -> garbage gamma"):
+#   * crossed quotes (bid > ask) are dropped anywhere -- stale/locked markets.
+#   * DEEP-ITM contracts (intrinsic depth > ITM_DEPTH_FILTER of spot) with no bid
+#     or a relative spread wider than MAX_ITM_REL_SPREAD are dropped: their IV is
+#     extracted from a sliver of extrinsic value and is noise-dominated.
+#   * Deep-OTM wings are NEVER quote-filtered (zero-bid wings still carry real
+#     tail gamma via the ask-side IV; dropping them would destroy wing gamma).
+ITM_DEPTH_FILTER    = 0.05        # "deep ITM" = more than 5% in the money
+MAX_ITM_REL_SPREAD  = 0.25        # deep-ITM (ask-bid)/mid wider than this = stale/garbage
 DEFAULT_GRID_STEPS    = 1000      # grid resolution for the flip search
 DAY_COUNT             = 365.0     # ACT/365 calendar-time convention
 EXPIRY_HOUR_ET        = 16        # PM-settled SPXW expire at the 16:00 ET cash close
@@ -169,6 +219,7 @@ class Config:
     multiplier: int = DEFAULT_MULTIPLIER
     rate: float = DEFAULT_RATE
     div_yield: float = DEFAULT_DIV_YIELD
+    div_src: str = "default 0"    # where q came from (flag / built-in map / default)
     price_range: float = DEFAULT_PRICE_RANGE
     steps: int = DEFAULT_GRID_STEPS
     convention: DealerConvention = field(default_factory=lambda: CONV_STANDARD)
@@ -475,9 +526,15 @@ def parse_schwab_chain(data):
         "no IV" sentinel -> convert to a decimal and drop sentinels.
       * spot comes straight from `underlyingPrice` (fallback underlying.mark/last).
       * Skips contracts with no/zero OI or no/sentinel IV, counting the drops.
+      * Quote-quality filters: crossed quotes (bid > ask) dropped anywhere;
+        DEEP-ITM contracts (depth > ITM_DEPTH_FILTER) with no bid or a relative
+        spread > MAX_ITM_REL_SPREAD dropped (their IV is noise -- garbage IV in,
+        garbage gamma out). Deep-OTM wings are never quote-filtered: zero-bid
+        wings still carry real tail gamma, and per-strike IV must be preserved.
+        Contracts with no bid/ask fields at all skip the filter (can't judge).
     """
     contracts = []
-    dropped = {"no_oi": 0, "no_iv": 0, "malformed": 0}
+    dropped = {"no_oi": 0, "no_iv": 0, "malformed": 0, "crossed": 0, "itm_bad_quote": 0}
     status = data.get("status")
 
     under = data.get("underlying") or {}
@@ -519,6 +576,31 @@ def parse_schwab_chain(data):
                     if not math.isfinite(ivf) or ivf <= 0:
                         dropped["no_iv"] += 1
                         continue
+
+                    # ---- quote-quality filters (see docstring) ----
+                    try:
+                        bidf = float(o["bid"]) if o.get("bid") is not None else None
+                    except (TypeError, ValueError):
+                        bidf = None
+                    try:
+                        askf = float(o["ask"]) if o.get("ask") is not None else None
+                    except (TypeError, ValueError):
+                        askf = None
+                    if bidf is not None and askf is not None and askf > 0 and bidf > askf:
+                        dropped["crossed"] += 1          # crossed market: stale data
+                        continue
+                    if spot and (bidf is not None or askf is not None):
+                        deep_itm = ((cp == "call" and strike < spot * (1 - ITM_DEPTH_FILTER))
+                                    or (cp == "put" and strike > spot * (1 + ITM_DEPTH_FILTER)))
+                        if deep_itm:
+                            bad = bidf is None or bidf <= 0    # no bid on a deep-ITM = stale
+                            if not bad and askf is not None and askf > bidf:
+                                mid = 0.5 * (askf + bidf)
+                                bad = (askf - bidf) / mid > MAX_ITM_REL_SPREAD
+                            if bad:
+                                dropped["itm_bad_quote"] += 1
+                                continue
+
                     contracts.append(Contract(strike, exp_date, cp,
                                               float(oi), ivf / 100.0))
     return contracts, spot, ts_ns, dropped, status
@@ -641,20 +723,30 @@ def print_assumptions(cfg, rate_is_default):
     print("  Data source ......... Charles Schwab Trader API (Market Data /chains)")
     print("  Gamma source ........ computed via Black-Scholes-Merton from Schwab IV")
     print("                        (Schwab's own gamma/greeks are IGNORED).")
+    print("  IV handling ......... PER-STRIKE vendor IV; the smile is never flattened to ATM")
+    print("  Exercise style ...... European (BSM) gamma for ALL contracts; American early-")
+    print("                        exercise premium (SPY/QQQ) ignored -- small, short-dated")
+    print("  Time clock .......... CALENDAR ACT/365 (matches the vendor IV clock; trading-")
+    print("                        time T would break the sigma^2*T pairing)")
+    print("  Quote filters ....... crossed dropped; deep-ITM (>{:.0%}) with no bid or rel.".format(ITM_DEPTH_FILTER))
+    print("                        spread >{:.0%} dropped; OTM wings NEVER quote-filtered".format(MAX_ITM_REL_SPREAD))
     print("  Dealer convention ... {}".format(cfg.convention.label))
     print("                        call_sign={:+.0f}  put_sign={:+.0f}  (flippable)"
           .format(cfg.convention.call_sign, cfg.convention.put_sign))
     print("  Risk-free rate r .... {:.4f}{}".format(
         cfg.rate, "   <-- DEFAULT; set --rate to your current value" if rate_is_default else ""))
-    print("  Dividend yield q .... {:.4f}   (SPY ~0.012, QQQ ~0.006; default 0 -> set --div-yield)"
-          .format(cfg.div_yield))
+    print("  Dividend yield q .... {:.4f}   (source: {}; override with --div-yield)"
+          .format(cfg.div_yield, cfg.div_src))
     print("  Multiplier .......... {}".format(cfg.multiplier))
     print("  Day count ........... ACT/{:.0f}, time-to-expiry to {:02d}:00 ET (PM settle)"
           .format(DAY_COUNT, EXPIRY_HOUR_ET))
     print("  Flip search ......... total net GEX repriced over +/-{:.0%} in {} steps"
           .format(cfg.price_range, cfg.steps))
+    print("                        (sticky-strike: per-strike IV held fixed across the grid)")
     print("  GEX formula ......... gamma * OI * {} * spot^2 * 0.01   ($ per 1% move)"
           .format(cfg.multiplier))
+    print("  Unit warning ........ per-1% convention; per-POINT = value / (0.01 * spot).")
+    print("                        (SqueezeMetrics publishes per-point -- do not compare raw.)")
     print("  Net GEX ............. SUM(call GEX) - SUM(put GEX) under the convention above")
     print()
 
@@ -672,8 +764,9 @@ def print_data_health(spot, ts_ns, dropped, dropped_expired, floored, n_kept, to
         except Exception:
             print("  Underlying snapshot . {} (ns)".format(ts_ns))
     print("  Contracts used ...... {}".format(n_kept))
-    print("  Dropped: no OI={}  no IV={}  malformed={}  expired={}".format(
-        dropped["no_oi"], dropped["no_iv"], dropped["malformed"], dropped_expired))
+    print("  Dropped: no OI={}  no IV={}  crossed={}  deep-ITM bad quote={}  malformed={}  expired={}".format(
+        dropped["no_oi"], dropped["no_iv"], dropped.get("crossed", 0),
+        dropped.get("itm_bad_quote", 0), dropped["malformed"], dropped_expired))
     if floored:
         print("  WARNING: {} contract(s) had time-to-expiry below the {:.0f}s floor; T was "
               "clamped (ATM 0DTE gamma is numerically explosive near the close).".format(floored, T_FLOOR_SECONDS))
@@ -940,7 +1033,9 @@ def parse_args(argv=None):
     p.add_argument("--expiry", default=None,
                    help="'0dte' | 'all' | YYYY-MM-DD. Default: compute BOTH 0DTE and all expiries.")
     p.add_argument("--rate", type=float, default=DEFAULT_RATE, help="risk-free rate (annual, decimal).")
-    p.add_argument("--div-yield", type=float, default=DEFAULT_DIV_YIELD, help="dividend yield (annual, decimal).")
+    p.add_argument("--div-yield", type=float, default=None,
+                   help="dividend yield (annual, decimal). Default: built-in per-ticker map "
+                        "(SPY 0.012, QQQ 0.006, ...), else 0.")
     p.add_argument("--multiplier", type=int, default=DEFAULT_MULTIPLIER, help="contract multiplier.")
     p.add_argument("--price-range", type=float, default=DEFAULT_PRICE_RANGE, help="+/- fraction for flip search.")
     p.add_argument("--steps", type=int, default=DEFAULT_GRID_STEPS, help="grid steps for flip search.")
@@ -978,8 +1073,17 @@ def build_config(args):
     # Sensitivity always flips the put sign relative to the chosen convention.
     flipped = DealerConvention(conv.call_sign, -conv.put_sign,
                                "put sign flipped to {:+.0f}".format(-conv.put_sign))
+    # Dividend yield: explicit flag wins; else the built-in per-ticker map ("get
+    # dividends right for single names"); else 0. Source is printed for audit.
+    base = args.ticker.upper().lstrip("$")
+    if args.div_yield is not None:
+        q, q_src = args.div_yield, "--div-yield flag"
+    elif base in TICKER_DIV_YIELDS:
+        q, q_src = TICKER_DIV_YIELDS[base], "built-in map for {} (approx.)".format(base)
+    else:
+        q, q_src = 0.0, "default 0 (no map entry for {})".format(base)
     return Config(ticker=args.ticker, multiplier=args.multiplier, rate=args.rate,
-                  div_yield=args.div_yield, price_range=args.price_range, steps=args.steps,
+                  div_yield=q, div_src=q_src, price_range=args.price_range, steps=args.steps,
                   convention=conv, flipped_convention=flipped)
 
 
@@ -989,6 +1093,65 @@ def prior_trading_session(today):
     while d.weekday() >= 5:  # Sat=5, Sun=6
         d -= timedelta(days=1)
     return d
+
+
+def third_friday(year, month):
+    """Third Friday of the month (monthly OpEx; triple witching in Mar/Jun/Sep/Dec)."""
+    d = date(year, month, 15)                 # third Friday falls on the 15th..21st
+    return d + timedelta(days=(4 - d.weekday()) % 7)
+
+
+def next_monthly_opex(today):
+    """Next monthly OpEx (3rd Friday) on or after `today`."""
+    tf = third_friday(today.year, today.month)
+    if today > tf:
+        y, m = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+        tf = third_friday(y, m)
+    return tf
+
+
+def print_gamma_buckets(contracts, spot, cfg, today):
+    """Decompose gamma by expiry bucket -- weight by HEDGING URGENCY, not magnitude.
+
+    The governing rule: match the expiry set to the holding period. An all-expiry
+    total mixes 0DTE gamma (rehedged hour-by-hour, gone at 16:00) with OI months
+    out that will NOT be rebalanced today. This table shows how much of the
+    headline number is fast vs slow money. First-match bucket assignment.
+    """
+    opex = next_monthly_opex(today)
+    buckets = [
+        ("0DTE (evaporates 16:00 ET)", lambda d: d == today),
+        ("<= 1 week",                  lambda d: d <= today + timedelta(days=7)),
+        ("<= monthly OpEx {}".format(opex.strftime("%b %d")), lambda d: d <= opex),
+        ("beyond OpEx (slow money)",   lambda d: True),
+    ]
+    K, T, iv, oi, sign, iscall = _to_arrays(contracts, cfg.convention)
+    signed = _signed_dollar_gex(K, T, iv, oi, sign, spot, cfg)
+    gross_total = float(np.abs(signed).sum())
+
+    idx = np.empty(len(contracts), dtype=int)
+    for i, c in enumerate(contracts):
+        for b, (_, match) in enumerate(buckets):
+            if match(c.expiry):
+                idx[i] = b
+                break
+
+    print("-" * 78)
+    print("GAMMA BY EXPIRY  (weight by hedging urgency, not magnitude alone)")
+    print("-" * 78)
+    print("  {:<28}{:>15}{:>9}{:>16}".format("bucket", "gross |GEX|", "share", "net GEX"))
+    for b, (label, _) in enumerate(buckets):
+        m = idx == b
+        gross_b = float(np.abs(signed[m]).sum())
+        net_b = float(signed[m].sum())
+        share = gross_b / gross_total if gross_total > 0 else 0.0
+        print("  {:<28}{:>15}{:>8.1%}{:>16}".format(label, fmt_bn(gross_b).replace("+", ""),
+                                                    share, fmt_bn(net_b)))
+    print()
+    print("  Read: 0DTE gamma is enormous intraday and gone at the close (and its OI")
+    print("  is a day stale); 'slow money' will not be rebalanced today. Charm/vanna")
+    print("  dominate into monthly OpEx roll-off and are NOT modeled here.")
+    print()
 
 
 def select_views(all_contracts, expiry_arg, today):
@@ -1043,18 +1206,11 @@ def run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
                            len(all_contracts), today, prior_trading_session(today))
         print_side_by_side(computed)
 
-        # Fraction of gamma in 0DTE vs later (needs the all-expiries population)
-        if args.expiry is None:
-            all_view = dict(computed)["ALL EXPIRIES"]
-            zero_view = dict(computed)["0DTE"]
-            if not all_view.get("empty") and all_view["gross"] > 0:
-                frac = (0.0 if zero_view.get("empty") else zero_view["gross"]) / all_view["gross"]
-                print("-" * 78)
-                print("GAMMA CONCENTRATION")
-                print("-" * 78)
-                print("  0DTE gross gamma / all-expiry gross gamma = {:.1%}".format(frac))
-                print("  (remaining {:.1%} sits in later expiries)".format(1 - frac))
-                print()
+        # Hedging-urgency decomposition of the all-expiries population (the
+        # governing rule: match the expiry set to the holding period).
+        all_cs = next((cs for lbl, cs in views_raw if lbl == "ALL EXPIRIES" and cs), None)
+        if all_cs:
+            print_gamma_buckets(all_cs, spot, cfg, today)
 
         for lbl, view in computed:
             print_view_detail(lbl, view, spot, spy_ratio, cfg)
@@ -1111,7 +1267,7 @@ def main(argv=None):
         demo = make_demo_chain(spot, today, today + timedelta(days=30))
         all_contracts, dropped_expired, floored = enrich_and_filter_time(demo, demo_now)
         ts_ns = int(demo_now.timestamp() * 1e9)
-        dropped = {"no_oi": 0, "no_iv": 0, "malformed": 0}
+        dropped = {"no_oi": 0, "no_iv": 0, "malformed": 0, "crossed": 0, "itm_bad_quote": 0}
         spy_ratio = SPY_RATIO_FALLBACK
         run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
             dropped_expired, floored, rate_is_default)
@@ -1165,8 +1321,7 @@ def main(argv=None):
     contracts, spot, ts_ns, dropped, status = parse_schwab_chain(data)
     if status and status != "SUCCESS":
         print("  WARNING: Schwab chains status = {}".format(status))
-    print("  {} raw contracts parsed.".format(
-        len(contracts) + dropped["no_oi"] + dropped["no_iv"] + dropped["malformed"]))
+    print("  {} raw contracts parsed.".format(len(contracts) + sum(dropped.values())))
     if spot is None:
         print("ERROR: could not determine underlying spot price from the chain.",
               file=sys.stderr)
