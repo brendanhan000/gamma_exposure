@@ -30,24 +30,42 @@ LOG="$GEX_DIR/logs/daily_gex.log"
 ts() { date "+%Y-%m-%d %H:%M:%S %Z"; }
 echo "[$(ts)] start $TAG (${DAYS}d) tickers=[$TICKERS]" >>"$LOG"
 
+# Preflight: warn 1.5 days BEFORE the 7-day Schwab refresh token dies, so the
+# re-login happens on your schedule instead of as a morning outage.
+AGE_WARN="$("$GEX_PY" -c 'import json,time; d=json.load(open(".schwab_token.json")); ct=d.get("creation_timestamp") or 0; age=(time.time()-ct)/86400.0; age>5.5 and print("WARNING: Schwab token is {:.1f} days old (dies at 7) -> run scripts/schwab_setup.py".format(age))' 2>/dev/null)"
+
 BODY=""
 CHARTS=()
-RC_ALL=0
+N_TOTAL=0
+N_FAIL=0
+AUTH_DEAD=0
 for T in $TICKERS; do
+    N_TOTAL=$((N_TOTAL + 1))
     OUT="$("$GEX_PY" gex.py --ticker "$T" --expiry all --all-days "$DAYS" --levels-only 2>&1)"; RC=$?
     printf '%s\n' "$OUT" >>"$LOG"
-    [ "$RC" -ne 0 ] && RC_ALL=1
+    if printf '%s' "$OUT" | grep -qiE "refresh token is invalid|unsupported_token_type|OAuthError"; then
+        AUTH_DEAD=1
+    fi
+    [ "$RC" -ne 0 ] && N_FAIL=$((N_FAIL + 1))
     BLOCK="$(printf '%s\n' "$OUT" | grep -E '\| spot |regime |flip |call wall |put wall |net GEX ')"
-    [ -z "$BLOCK" ] && BLOCK="$T | run failed (rc=$RC)"
+    [ -z "$BLOCK" ] && BLOCK="$T | run failed (rc=$RC): $(printf '%s\n' "$OUT" | grep -m1 'ERROR' | cut -c1-90)"
     BODY="${BODY}${BLOCK}"$'\n\n'
     if [ "$SEND_CHARTS" = "1" ]; then
         CH="$(printf '%s\n' "$OUT" | sed -n 's/.*chart saved: //p' | tail -n 1)"
         [ -n "$CH" ] && [ -f "$CH" ] && CHARTS+=("$CH")
     fi
 done
+[ -n "$AGE_WARN" ] && BODY="${BODY}${AGE_WARN}"$'\n'
 
 TITLE="GEX $TAG (${DAYS}d) $(TZ=America/New_York date +%m/%d)"
-[ "$RC_ALL" -ne 0 ] && TITLE="GEX $TAG — RUN FAILED (re-run scripts/schwab_setup.py?)"
+if [ "$AUTH_DEAD" -eq 1 ]; then
+    TITLE="GEX $TAG - SCHWAB TOKEN EXPIRED: run scripts/schwab_setup.py"
+elif [ "$N_FAIL" -eq "$N_TOTAL" ]; then
+    TITLE="GEX $TAG - RUN FAILED (all $N_TOTAL tickers; see logs/daily_gex.log)"
+elif [ "$N_FAIL" -gt 0 ]; then
+    TITLE="GEX $TAG - PARTIAL ($((N_TOTAL - N_FAIL))/$N_TOTAL ok)"
+fi
+RC_ALL=$N_FAIL
 
 # ---- notifiers (first configured one wins) ----
 send_text() {  # title body
@@ -87,6 +105,6 @@ USED="$(send_text "$TITLE" "$BODY")"
 if [ "$USED" != none ] && [ "${#CHARTS[@]}" -gt 0 ]; then
     for ch in "${CHARTS[@]}"; do send_image "$TITLE — $(basename "$ch" .png)" "$ch"; done
 fi
-echo "[$(ts)] $TAG notified via $USED (rc=$RC_ALL, charts=${#CHARTS[@]})" >>"$LOG"
+echo "[$(ts)] $TAG notified via $USED (rc=$RC_ALL, charts=${#CHARTS[@]}, title=\"$TITLE\")" >>"$LOG"
 [ "$USED" = none ] && echo "[$(ts)] WARNING: no notifier configured — set PUSHOVER_*/TELEGRAM_*/NTFY_* in .env" >>"$LOG"
 exit 0

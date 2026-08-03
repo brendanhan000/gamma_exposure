@@ -28,6 +28,7 @@ from gex import (
     parse_schwab_chain,
     to_schwab_symbol,
     get_schwab_client,
+    fetch_chain_schwab,
     cross_quote,
     parse_args,
     build_config,
@@ -291,6 +292,68 @@ def test_monthly_opex_calendar():
     assert next_monthly_opex(date(2026, 7, 17)) == date(2026, 7, 17)   # OpEx day itself
     assert next_monthly_opex(date(2026, 7, 18)) == date(2026, 8, 21)   # after -> next month
     assert next_monthly_opex(date(2026, 12, 20)) == date(2027, 1, 15)  # year rollover
+
+
+class _OkResp:
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"status": "SUCCESS"}
+
+
+def test_fetch_chain_retries_transient_then_succeeds():
+    # Two timeouts, then success: the fetch must retry through transient faults
+    # (scheduled morning runs were dying on a single reset/timeout).
+    class _Flaky:
+        calls = 0
+
+        def get_option_chain(self, symbol, **kw):
+            self.calls += 1
+            if self.calls <= 2:
+                raise TimeoutError("the read operation timed out")
+            return _OkResp()
+
+    c = _Flaky()
+    out = fetch_chain_schwab(c, "SPY", retry_wait=0.0)
+    assert out["status"] == "SUCCESS"
+    assert c.calls == 3
+
+
+def test_fetch_chain_does_not_retry_auth_or_4xx():
+    # An expired refresh token must fail FAST (re-login is the only fix).
+    class OAuthError(Exception):
+        pass
+
+    class _AuthDead:
+        calls = 0
+
+        def get_option_chain(self, symbol, **kw):
+            self.calls += 1
+            raise OAuthError("refresh token is invalid, expired or revoked")
+
+    a = _AuthDead()
+    with pytest.raises(OAuthError):
+        fetch_chain_schwab(a, "SPY", retry_wait=0.0)
+    assert a.calls == 1
+
+    # 4xx responses are client errors -- retrying cannot heal them.
+    class _HttpErr(Exception):
+        def __init__(self):
+            super().__init__("404 Not Found")
+            self.response = type("R", (), {"status_code": 404})()
+
+    class _NotFound:
+        calls = 0
+
+        def get_option_chain(self, symbol, **kw):
+            self.calls += 1
+            raise _HttpErr()
+
+    n = _NotFound()
+    with pytest.raises(_HttpErr):
+        fetch_chain_schwab(n, "SPY", retry_wait=0.0)
+    assert n.calls == 1
 
 
 def test_get_schwab_client_errors_without_creds_or_token(tmp_path):

@@ -137,6 +137,39 @@ $PY -m pytest test_gex.py               # run the test suite
 
 ---
 
+## Mobile app (live levels on your iPhone)
+
+`server.py` wraps `gex.py` in a local HTTP API (FastAPI, port **8787**) and serves
+a mobile web app from `static/` — same math, same filters, live data, with a
+**configurable ticker and a real expiration picker** (already-settled dates are
+excluded automatically). Results are cached 60s per query so refreshes don't
+hammer Schwab; on auth errors the server heals itself after you re-run
+`scripts/schwab_setup.py` (no restart needed).
+
+**Start it** (or install the always-on service below):
+```bash
+/opt/anaconda3/bin/python server.py
+```
+
+**On your iPhone** (same Wi-Fi): open **http://192.168.1.166:8787** in Safari →
+Share → **Add to Home Screen** → it installs as a standalone dark-mode app with
+ticker chips, expiry picker, regime banner, level cards, per-strike chart
+(gridlines every 10), and the hedging-urgency bucket table.
+
+**Always-on service** (starts at login, restarts on crash):
+```bash
+cp scripts/com.brendanhan.gex-server.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-server.plist
+```
+
+API (for any future native client): `GET /api/gex?ticker=QQQ&expiry=both|0dte|all|YYYY-MM-DD`,
+`GET /api/expirations?ticker=`, `GET /api/health`; interactive docs at `/docs`.
+
+Notes: LAN-only by default (behind your router). For access away from home, put
+Tailscale on the Mac + phone and use the Mac's Tailscale address. Chain fetches
+carry a 90s hard deadline (`GEX_FETCH_DEADLINE`) — a trickling Schwab response
+can otherwise stall for many minutes.
+
 ## Automation → your phone (macOS launchd)
 
 Pushes **SPY + QQQ** levels + charts to your iPhone on three cadences, each looking

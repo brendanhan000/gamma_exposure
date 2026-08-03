@@ -68,9 +68,49 @@ def main(argv=None) -> int:
         client = client_from_manual_flow(app_key, app_secret, CALLBACK, TOKEN_PATH)
     else:
         print("[auth] launching browser login flow (callback {}) ...".format(CALLBACK))
-        print("       (if nothing happens after login, Ctrl+C and re-run with --manual)")
-        client = easy_client(api_key=app_key, app_secret=app_secret,
-                             callback_url=CALLBACK, token_path=TOKEN_PATH)
+        print("       (on failure it falls back to the manual copy/paste flow)")
+        try:
+            client = easy_client(api_key=app_key, app_secret=app_secret,
+                                 callback_url=CALLBACK, token_path=TOKEN_PATH)
+        except Exception as e:
+            name = type(e).__name__
+            # State-mismatch (CSRF) = the redirect came from a PREVIOUS attempt
+            # (stale 127.0.0.1:8182 tab / history replay / double run). Redirect
+            # timeouts are the other flaky browser-flow failure. Both are fixed
+            # by the manual flow, so fall back in the same run.
+            if ("MismatchingState" in name or "mismatching_state" in str(e)
+                    or "Timed out" in str(e) or "RedirectTimeout" in name):
+                print("\n[auth] browser flow failed ({}).".format(name))
+                print("       The redirect it caught was NOT from this attempt -- close any old")
+                print("       127.0.0.1:8182 tabs. Falling back to the MANUAL flow; complete it")
+                print("       in one go using ONLY the URL printed below:\n")
+                from schwab.auth import client_from_manual_flow
+                client = client_from_manual_flow(app_key, app_secret, CALLBACK, TOKEN_PATH)
+            else:
+                raise
+    # Validate what was actually written. The broken-stub signature (seen live)
+    # is a ~28-char access_token with NO refresh_token -- Schwab's token endpoint
+    # returns that degenerate form on a bad/missing ?code=, and it dies after
+    # 30 min unrecoverably (token_invalid). A HEALTHY current-era Schwab token is
+    # itself short (~76-char access + ~140-char refresh + id_token), so the
+    # refresh_token's presence is the load-bearing check; the length bound only
+    # catches the extreme stub. Catch it HERE, not at tomorrow's 07:45 run.
+    import json
+    with open(TOKEN_PATH) as f:
+        tok = (json.load(f).get("token") or {})
+    problems = []
+    if not tok.get("refresh_token"):
+        problems.append("no refresh_token (unrecoverable after 30 min)")
+    if len(tok.get("access_token") or "") < 40:
+        problems.append("access_token degenerate stub ({} chars)"
+                        .format(len(tok.get("access_token") or "")))
+    if problems:
+        print("\n[auth] TOKEN LOOKS BROKEN: {}.".format("; ".join(problems)), file=sys.stderr)
+        print("       This is the signature of an exchange made without a valid ?code=", file=sys.stderr)
+        print("       parameter. Re-run with --manual and paste the FULL redirect URL", file=sys.stderr)
+        print("       from the address bar -- it must contain 'code=' (ends %40) and", file=sys.stderr)
+        print("       must be pasted within ~30s of approving.", file=sys.stderr)
+        return 1
     print("[auth] OK -- token written to {} (refresh expires in ~7 days)".format(TOKEN_PATH))
 
     # 2) Live verification: pull a minimal chain slice and run it through gex's

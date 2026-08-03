@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Always-on GEX API + mobile app server (server.py on port 8787).
+  KeepAlive restarts it if it crashes; RunAtLoad starts it at login.
+  Install:
+    cp scripts/com.brendanhan.gex-server.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-server.plist
+  Remove:
+    launchctl bootout gui/$(id -u)/com.brendanhan.gex-server
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brendanhan.gex-server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/anaconda3/bin/python</string>
+        <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/server.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/logs/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/logs/server.log</string>
+</dict>
+</plist>

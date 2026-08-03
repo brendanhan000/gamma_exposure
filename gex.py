@@ -494,15 +494,29 @@ def get_schwab_client(app_key, app_secret, token_path, callback=DEFAULT_CALLBACK
         raise RuntimeError(
             "schwab-py is required for live data: pip install 'schwab-py>=1.3' "
             "(needs Python >= 3.10).") from exc
-    return client_from_token_file(token_path, app_key, app_secret)
+    client = client_from_token_file(token_path, app_key, app_secret)
+    # Explicit HTTP timeout: without it a dying connection can hang for minutes
+    # (observed ~8 min/ticker in scheduled runs). Guarded: older schwab-py only.
+    try:
+        client.set_timeout(30.0)
+    except Exception:
+        pass
+    return client
 
 
-def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_count=None):
+def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_count=None,
+                       max_retries=3, retry_wait=5.0):
     """One schwab-py get_option_chain() call -> full chain JSON (spot + OI + IV).
 
     `client` is a schwab-py client (see get_schwab_client). `from_date`/`to_date`
     are datetime.date objects. contractType defaults to ALL server-side, so both
     callExpDateMap and putExpDateMap come back in one un-paginated payload.
+
+    TRANSIENT failures (connection resets, read timeouts, 5xx) are retried up to
+    `max_retries` times with linear backoff -- scheduled morning runs were dying
+    on single network hiccups. NON-transient failures (4xx, OAuth/auth errors)
+    are raised immediately: retrying an expired refresh token cannot help, only
+    a re-login can (scripts/schwab_setup.py).
     """
     kwargs = {"include_underlying_quote": True}
     if from_date is not None:
@@ -511,9 +525,25 @@ def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_coun
         kwargs["to_date"] = to_date
     if strike_count is not None:
         kwargs["strike_count"] = strike_count
-    resp = client.get_option_chain(symbol, **kwargs)
-    resp.raise_for_status()
-    return resp.json()
+
+    last = None
+    for attempt in range(max_retries):
+        try:
+            resp = client.get_option_chain(symbol, **kwargs)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            # Auth errors: raise now (needs re-login, not a retry).
+            if "OAuth" in type(e).__name__ or "token" in str(e).lower():
+                raise
+            # HTTP 4xx: client-side problem, retrying cannot heal it.
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code is not None and 400 <= code < 500:
+                raise
+            last = e
+            if attempt < max_retries - 1:
+                time.sleep(retry_wait * (attempt + 1))   # e.g. 5s, then 10s
+    raise last
 
 
 def parse_schwab_chain(data):
@@ -1110,13 +1140,13 @@ def next_monthly_opex(today):
     return tf
 
 
-def print_gamma_buckets(contracts, spot, cfg, today):
+def gamma_expiry_buckets(contracts, spot, cfg, today):
     """Decompose gamma by expiry bucket -- weight by HEDGING URGENCY, not magnitude.
 
     The governing rule: match the expiry set to the holding period. An all-expiry
     total mixes 0DTE gamma (rehedged hour-by-hour, gone at 16:00) with OI months
-    out that will NOT be rebalanced today. This table shows how much of the
-    headline number is fast vs slow money. First-match bucket assignment.
+    out that will NOT be rebalanced today. First-match bucket assignment.
+    Returns [{"label", "gross", "share", "net"}, ...] (dollars, share of gross).
     """
     opex = next_monthly_opex(today)
     buckets = [
@@ -1136,17 +1166,29 @@ def print_gamma_buckets(contracts, spot, cfg, today):
                 idx[i] = b
                 break
 
+    out = []
+    for b, (label, _) in enumerate(buckets):
+        m = idx == b
+        gross_b = float(np.abs(signed[m]).sum())
+        out.append({
+            "label": label,
+            "gross": gross_b,
+            "share": gross_b / gross_total if gross_total > 0 else 0.0,
+            "net": float(signed[m].sum()),
+        })
+    return out
+
+
+def print_gamma_buckets(contracts, spot, cfg, today):
+    """Render gamma_expiry_buckets() as the console table."""
+    rows = gamma_expiry_buckets(contracts, spot, cfg, today)
     print("-" * 78)
     print("GAMMA BY EXPIRY  (weight by hedging urgency, not magnitude alone)")
     print("-" * 78)
     print("  {:<28}{:>15}{:>9}{:>16}".format("bucket", "gross |GEX|", "share", "net GEX"))
-    for b, (label, _) in enumerate(buckets):
-        m = idx == b
-        gross_b = float(np.abs(signed[m]).sum())
-        net_b = float(signed[m].sum())
-        share = gross_b / gross_total if gross_total > 0 else 0.0
-        print("  {:<28}{:>15}{:>8.1%}{:>16}".format(label, fmt_bn(gross_b).replace("+", ""),
-                                                    share, fmt_bn(net_b)))
+    for r in rows:
+        print("  {:<28}{:>15}{:>8.1%}{:>16}".format(
+            r["label"], fmt_bn(r["gross"]).replace("+", ""), r["share"], fmt_bn(r["net"])))
     print()
     print("  Read: 0DTE gamma is enormous intraday and gone at the close (and its OI")
     print("  is a day stale); 'slow money' will not be rebalanced today. Charm/vanna")
