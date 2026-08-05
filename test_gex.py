@@ -287,6 +287,39 @@ def test_div_yield_per_ticker_map():
     assert build_config(parse_args(["--ticker", "QQQ", "--div-yield", "0.01"])).div_yield == 0.01
 
 
+def test_chain_archive_persists_raw_rows(tmp_path):
+    # The archive must keep what the GEX filters THROW AWAY: zero-OI strikes and
+    # the -999 IV sentinel are the baseline tomorrow's dOI is measured against.
+    import gex
+    import csv
+    import gzip
+
+    rows = gex.chain_snapshot_rows(SCHWAB_SAMPLE, "SPY")
+    assert len(rows) == 4                      # all four contracts, unfiltered
+    ivs = [r[gex.CHAIN_COLUMNS.index("iv_pct")] for r in rows]
+    ois = [r[gex.CHAIN_COLUMNS.index("oi")] for r in rows]
+    assert -999.0 in ivs                       # sentinel preserved verbatim
+    assert 0 in ois                            # zero-OI strike preserved
+    assert 18.42 in ivs                        # vendor PERCENT units, not decimal
+
+    path = gex.save_chain_snapshot(SCHWAB_SAMPLE, "SPY", chain_dir=str(tmp_path))
+    assert path and os.path.exists(path)
+    with gzip.open(path, "rt") as f:
+        back = list(csv.DictReader(f))
+    assert len(back) == 4
+    assert set(back[0]) == set(gex.CHAIN_COLUMNS)
+    assert back[0]["ticker"] == "SPY"
+    assert float(back[0]["spot"]) == 5900.0
+
+
+def test_chain_archive_never_raises_on_bad_input(tmp_path):
+    # Archiving is best-effort: it must never break a live run.
+    import gex
+    assert gex.save_chain_snapshot({}, "SPY", chain_dir=str(tmp_path)) is None
+    assert gex.save_chain_snapshot({"callExpDateMap": None}, "SPY",
+                                   chain_dir=str(tmp_path)) is None
+
+
 def test_explain_empty_view_distinguishes_expired_from_missing():
     # An empty 0DTE view after 16:00 ET is CORRECT (the options settled), not a
     # failure. The message must say which, so the user does not think it broke.

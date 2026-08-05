@@ -310,6 +310,13 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
         raise HTTPException(status_code=status, detail={"code": code, "message": msg})
 
     _note_auth(True)
+    # Archive every real fetch. Open interest is never backfillable, so if the
+    # Mac slept through the scheduled morning job, an app tap still captures the
+    # day. Same-day writes overwrite (identical OI, more complete volume), and
+    # this only runs on a cache MISS, so it costs ~20ms against a multi-second
+    # network fetch.
+    gex.save_chain_snapshot(data, t, chain_dir=os.environ.get("GEX_CHAIN_DIR", gex.CHAIN_DIR))
+
     contracts, spot, ts_ns, dropped, status = gex.parse_schwab_chain(data)
     if spot is None:
         raise HTTPException(status_code=502, detail={

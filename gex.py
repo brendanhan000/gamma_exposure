@@ -720,6 +720,83 @@ def parse_schwab_chain(data):
     return contracts, spot, ts_ns, dropped, status
 
 
+# ---------------------------------------------------------------------------
+# Chain persistence (build your own open-interest history)
+# ---------------------------------------------------------------------------
+# Open interest is published once daily and is NEVER backfillable: Schwab serves
+# only the current snapshot, so a day not captured is a day lost forever. Saving
+# every live fetch accumulates a private time series that supports:
+#   * dOI per strike per day -- where positioning is actually BUILDING vs. stale
+#     OI that has sat unchanged for weeks (the headline number cannot tell you).
+#   * A crude aggressor read: OI rising while prints sit near the ask suggests
+#     customers bought / dealers sold, i.e. dealers SHORT that strike's gamma.
+#   * Empirical calibration of the dealer sign convention -- the assumption that
+#     drives the LOW CONFIDENCE warning -- against realized outcomes.
+# Rows are written RAW (pre-filter, including zero-OI strikes and the -999 IV
+# sentinel): the GEX filters are a modeling choice, but the archive should be a
+# faithful record. Format is gzipped CSV -- stdlib only, ~10x smaller than JSON,
+# and directly loadable with pandas.read_csv().
+CHAIN_DIR = "chains"
+CHAIN_COLUMNS = ["snapshot_ts_et", "oi_date", "ticker", "spot", "expiry", "cp",
+                 "strike", "oi", "iv_pct", "bid", "ask", "last", "volume"]
+
+
+def chain_snapshot_rows(data, ticker, now=None):
+    """Flatten a raw Schwab chain payload into archive rows (no filtering).
+
+    iv_pct is the vendor's PERCENT value verbatim (including the -999 'no IV'
+    sentinel) so the archive loses nothing; divide by 100 for a decimal vol.
+    """
+    now = now_et() if now is None else now
+    under = data.get("underlying") or {}
+    spot = data.get("underlyingPrice")
+    if spot is None:
+        spot = under.get("mark") or under.get("last")
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S%z")
+    oi_date = prior_trading_session(now.date()).isoformat()
+
+    rows = []
+    for map_key, cp in (("callExpDateMap", "call"), ("putExpDateMap", "put")):
+        for exp_key, by_strike in (data.get(map_key) or {}).items():
+            exp = str(exp_key).split(":")[0]
+            for strike_str, opts in by_strike.items():
+                for o in opts:
+                    rows.append([
+                        ts, oi_date, ticker, spot, exp, cp,
+                        o.get("strikePrice", strike_str), o.get("openInterest"),
+                        o.get("volatility"), o.get("bid"), o.get("ask"),
+                        o.get("last"), o.get("totalVolume"),
+                    ])
+    return rows
+
+
+def save_chain_snapshot(data, ticker, chain_dir=CHAIN_DIR, now=None):
+    """Persist one chain fetch to chains/<TICKER>/<YYYY-MM-DD>.csv.gz.
+
+    Same-day re-runs overwrite: a later snapshot carries more complete volume,
+    and OI is a once-daily figure so nothing is lost. Never raises -- archiving
+    must not break a live run.
+    """
+    import csv
+    import gzip
+    try:
+        now = now_et() if now is None else now
+        rows = chain_snapshot_rows(data, ticker, now=now)
+        if not rows:
+            return None
+        d = os.path.join(chain_dir, ticker.upper().lstrip("$"))
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, now.date().isoformat() + ".csv.gz")
+        with gzip.open(path, "wt", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(CHAIN_COLUMNS)
+            w.writerows(rows)
+        return path
+    except Exception as e:                      # archiving is best-effort
+        print("  NOTE: chain snapshot not saved ({})".format(e), file=sys.stderr)
+        return None
+
+
 def fetch_spx_spy_ratio(client, base_ticker, spot):
     """Live SPX/SPY ratio, runnable from EITHER leg of the pair.
 
@@ -1214,6 +1291,11 @@ def parse_args(argv=None):
                         "Create it with: python3 scripts/schwab_setup.py")
     p.add_argument("--levels-only", action="store_true",
                    help="print only a compact levels block (for notifications / quick pulls).")
+    p.add_argument("--no-save-chain", action="store_true",
+                   help="do NOT archive this chain fetch. Archiving is ON by default: open "
+                        "interest is never backfillable, so an unsaved day is lost forever.")
+    p.add_argument("--chain-dir", default=os.environ.get("GEX_CHAIN_DIR", CHAIN_DIR),
+                   help="directory for the chain archive.")
     p.add_argument("--demo", action="store_true", help="run on an offline synthetic chain (no credentials).")
     return p.parse_args(argv)
 
@@ -1484,6 +1566,12 @@ def main(argv=None):
             print("  (A 502 usually means the requested chain is too large; "
                   "reduce --all-days or pass a specific --expiry.)", file=sys.stderr)
         return 1
+
+    # Archive the RAW payload before any filtering (see save_chain_snapshot).
+    if not args.no_save_chain:
+        saved = save_chain_snapshot(data, cfg.ticker, chain_dir=args.chain_dir)
+        if saved:
+            print("  chain archived: {}".format(saved))
 
     contracts, spot, ts_ns, dropped, status = parse_schwab_chain(data)
     if status and status != "SUCCESS":
