@@ -137,36 +137,23 @@ python3 gex.py --demo                # offline synthetic chain
 
 ## Mobile app
 
-`server.py` wraps the core in a local HTTP API (FastAPI, port **8787**) and serves an installable iPhone app
-from `static/` — same math, live data, deliberately minimal:
-
-1. **Pick the underlying** — SPY or QQQ (two large buttons).
-2. **Pick the options expiry** — a real listed-expirations picker (`Fri, Aug 7`), plus *All expiries (45d)*
-   and *0DTE only*. Already-settled dates are excluded automatically.
-3. **Tap `GET FRESH LEVELS`** — a live pull that **bypasses the server cache** (`fresh=1`), so spot and IV
-   are current every time. The fetch timestamp is shown under the button.
-
-Results: regime banner (green long-gamma / red short-gamma) with LOW-CONFIDENCE badge, spot, gamma flip
-(with SPX cross-quote for SPY), net GEX, both walls, a per-strike canvas chart with spot/flip/wall markers,
-and the expiry-bucket table.
+`server.py` wraps the core in a local HTTP API (FastAPI, port **8787**) and serves an installable phone app
+from `static/` — same math, live data, with a **configurable ticker** and a **real expiration picker**
+(already-settled dates are excluded automatically).
 
 ```bash
 python3 server.py
 ```
 
 On your iPhone (same Wi-Fi): open `http://<mac-lan-ip>:8787` in Safari → Share → **Add to Home Screen**.
-Your ticker and expiry choices persist between launches.
+Dark standalone app with regime banner, LOW-CONFIDENCE badge, level cards, per-strike canvas chart, and the
+expiry-bucket table.
 
-> **Intraday, honestly:** spot and IV are live, so levels do move during the session. **Open interest is
-> still from the prior close** — positions opened today, especially 0DTE, are not in it. The app states this
-> under every result rather than implying full real-time positioning.
+**API:** `GET /api/gex?ticker=&expiry=both|0dte|all|YYYY-MM-DD&all_days=` · `GET /api/expirations?ticker=` ·
+`GET /api/health` · interactive docs at `/docs`.
 
-**API:** `GET /api/gex?ticker=&expiry=both|0dte|all|YYYY-MM-DD&all_days=&fresh=0|1` ·
-`GET /api/expirations?ticker=` · `GET /api/health` · interactive docs at `/docs`.
-
-Results cache for 60s unless `fresh=1`; the server rebuilds its Schwab client when the token file changes, so
-it heals itself after a re-login with no restart. LAN-only by default — for remote access, use Tailscale on
-both devices.
+Results cache for 60s; the server rebuilds its Schwab client when the token file changes, so it heals itself
+after a re-login with no restart. LAN-only by default — for remote access, use Tailscale on both devices.
 
 **Always-on service:**
 ```bash
