@@ -1,366 +1,353 @@
-# Dealer Gamma Exposure (GEX) & Gamma-Flip Tool
+# Dealer Gamma Exposure (GEX) & Gamma-Flip Engine
 
-A single, auditable Python script (`gex.py`) that estimates **dealer gamma
-exposure** and the **gamma-flip (zero-gamma) level** for SPY/QQQ (and any
-optionable underlying with listed OI), to set a daily 0DTE trading bias. It pulls
-the full options-chain snapshot from the **Charles Schwab Trader API**,
-**recomputes gamma itself with Black-Scholes-Merton** (it does *not* trust the
-vendor greeks), and prints a plain-text bias summary plus a per-strike chart.
+Estimates **dealer gamma exposure** from live options-chain data and derives the price levels where
+market-maker hedging flow changes character: the **gamma flip**, the **call wall**, and the **put wall**.
+Those levels form a daily trading bias — where volatility is likely to be suppressed, where it is likely
+to be amplified, and which strikes act as magnets or accelerants.
 
-> **Why SPY and not SPX?** Schwab returns **zero open interest for cash-index
-> ($SPX) options**, and GEX is OI-weighted — so index GEX is impossible on this
-> data source. SPY is the standard dealer-gamma proxy; SPY levels are
-> cross-quoted to SPX using the live SPX/SPY ratio.
+Data comes from the **Charles Schwab Trader API**. Gamma is **recomputed from scratch** with
+Black-Scholes-Merton on per-strike implied volatility; vendor greeks are never trusted. Output is a
+plain-text bias summary, a per-strike chart, a JSON API, an installable iPhone app, and scheduled
+pre-market push notifications.
 
-Built to prioritize **correctness and auditability over features**: every
-modeling assumption is written in code comments *and* printed at runtime.
+Built to prioritize **correctness and auditability over features**: every modeling assumption is written
+in code comments *and* printed at runtime.
+
+> 📄 **[GEX_Technical_Reference.pdf](GEX_Technical_Reference.pdf)** — 20-page deep dive: full methodology,
+> function-by-function reference, production-hardening history, and Q&A.
 
 ---
 
-## Install
+## ⚠️ Read this first: SPY/QQQ, not SPX
+
+**Schwab returns zero open interest for cash-index options (`$SPX`, `XSP`).** GEX is open-interest-weighted,
+so **index GEX is not computable from this data source at any price** — verified live, where every `$SPX`
+strike returned `OI = 0` while SPY returned full OI on the identical request.
+
+The default ticker is therefore **SPY** (the standard dealer-gamma proxy), and SPY levels are cross-quoted
+into SPX terms using the **live** SPX/SPY ratio. Running `--ticker SPX` prints a warning pointing you back
+to the ETFs.
+
+---
+
+## What it produces
+
+```
+##############################################################################
+# BIAS SUMMARY  --  ALL EXPIRIES
+##############################################################################
+  Current spot ...... SPY 590.00
+  Regime ............ SHORT gamma  (spot < flip)
+  Gamma flip ........ SPY 592.35  |  SPX 5,923.50
+  Call wall ......... SPY 605.00
+  Put wall .......... SPY 590.00
+  Total net GEX ..... -0.025 $Bn  (-$25,183,398)
+  Interpretation .... Spot is 0.40% BELOW the flip -> dealers net SHORT gamma:
+                      they buy rallies / sell dips, amplifying vol. Bias:
+                      momentum/trend, wider ranges; a break of the put wall can
+                      accelerate lower. Reclaiming the flip calms it.
+##############################################################################
+```
+
+Plus a **hedging-urgency decomposition** on every run, so you can see how much of the headline number is
+fast money versus open interest that will never be rebalanced today:
+
+```
+GAMMA BY EXPIRY  (weight by hedging urgency, not magnitude alone)
+  bucket                          gross |GEX|    share         net GEX
+  0DTE (evaporates 16:00 ET)        4.85 $Bn    33.2%      -2.47 $Bn
+  <= 1 week                         4.30 $Bn    36.6%      -2.42 $Bn
+  <= monthly OpEx Aug 21            3.80 $Bn    32.3%      -1.52 $Bn
+  beyond OpEx (slow money)          0.29 $Bn     2.5%      -0.09 $Bn
+```
+
+…a per-strike GEX chart (PNG) with spot, flip, and both walls marked, and the same data as JSON for the
+mobile app.
+
+---
+
+## Quickstart
 
 ```bash
 pip install -r requirements.txt
+python3 gex.py --demo          # offline synthetic chain — no credentials needed
 ```
 
-> Python **3.11+** is the target. The core is kept compatible with **3.9+** (uses
-> `from __future__ import annotations`, no 3.10-only syntax), so `--demo` and the
-> tests run on stock macOS Python 3.9. The **live Schwab path uses `schwab-py`,
-> which needs Python ≥ 3.10** — its import is lazy, and `pip install -r
-> requirements.txt` skips it automatically on 3.9 (via an environment marker).
+> **Python:** the core is 3.9-compatible (`--demo` and the tests run anywhere). **Live data needs Python
+> ≥ 3.10** because `schwab-py` requires it; `pip install -r requirements.txt` skips it automatically on 3.9
+> via an environment marker.
 
-## Schwab setup (one time)
+### Schwab setup (one time, then weekly re-auth)
 
-Data comes from the **Charles Schwab Trader API** (Market Data) via the
-[`schwab-py`](https://schwab-py.readthedocs.io) library — **free with a Schwab
-brokerage account** (no per-asset entitlement), and the whole chain (spot + OI +
-IV) arrives in one `get_option_chain()` call. This mirrors the sibling
-`overnight_vs_intraday` project's setup, so the token file is interchangeable.
+Schwab market data is **free with a brokerage account** — no per-asset entitlement, and the whole chain
+(spot + OI + IV) arrives in one request.
 
-1. At **developer.schwab.com**, create an app, add the **Market Data Production**
-   product, and set the callback URL to **`https://127.0.0.1:8182`**. Wait for the
-   app status to reach **Ready For Use** (Schwab approves manually — can take days).
-2. Provide credentials (never hardcoded). Easiest: copy the template and source it:
+1. At **developer.schwab.com**, create an app, add the **Market Data Production** product, and set the
+   callback URL to **`https://127.0.0.1:8182`**. Wait for status **Ready For Use** (manual approval, can
+   take days).
+2. Copy the credential template and fill it in:
    ```bash
-   cp .env.example .env          # then fill in SCHWAB_APP_KEY / SCHWAB_APP_SECRET
-   set -a; source .env; set +a   # load into the shell
+   cp .env.example .env          # add SCHWAB_APP_KEY / SCHWAB_APP_SECRET
+   set -a; source .env; set +a
    ```
-   (or just `export SCHWAB_APP_KEY=... SCHWAB_APP_SECRET=...`).
-3. Install `schwab-py` (Python ≥ 3.10) and run the guided login + live check:
+3. Log in and verify:
    ```bash
    pip install 'schwab-py>=1.3'
-   python3 scripts/schwab_setup.py            # browser flow; --manual for copy/paste
+   python3 scripts/schwab_setup.py            # add --manual if the browser flow stalls
    ```
-   This opens a browser, writes the token to **`.schwab_token.json`** (git-ignored),
-   then pulls a tiny SPX chain and parses it to confirm everything works. The
-   refresh token lasts ~7 days, so re-run weekly.
+   Writes `.schwab_token.json` (git-ignored), then pulls a live chain to confirm the response shape
+   parses before you rely on it.
 
-No credentials yet? Use `python3 gex.py --demo` for an offline synthetic chain.
+> 🔑 **Schwab refresh tokens expire every 7 days** and require a browser re-login — there is no headless
+> renewal path. The tool warns from day 5.5 in every push, and failures are labelled
+> `SCHWAB TOKEN EXPIRED` with the exact command to run.
 
-## Run
+---
+
+## Usage
 
 ```bash
 python3 gex.py                       # default: 0DTE AND all expiries, side by side
-python3 gex.py --expiry 0dte         # 0DTE only
-python3 gex.py --expiry all          # all expiries (out to --all-days)
-python3 gex.py --expiry 2026-06-19   # a specific expiration
-python3 gex.py --rate 0.043 --div-yield 0.013   # override r and q
-python3 gex.py --convention flipped  # flip the dealer sign convention
-python3 gex.py --ticker SPY          # SPY ETF options proxy
-python3 gex.py --demo                # offline synthetic chain (no credentials)
+python3 gex.py --ticker QQQ          # any optionable underlying with listed OI
+python3 gex.py --expiry 0dte         # single view
+python3 gex.py --expiry 2026-08-21   # a specific expiration
+python3 gex.py --expiry all --all-days 90        # widen the expiration window
+python3 gex.py --rate 0.043 --div-yield 0.012    # override r and q
+python3 gex.py --convention flipped  # flip the dealer sign assumption
+python3 gex.py --levels-only         # compact output (used by notifications)
+python3 gex.py --demo                # offline synthetic chain
 ```
 
-Useful flags: `--ticker` (default **SPY**; `$SPX` has no OI on Schwab, so use
-ETFs), `--all-days` (window for `all`/default, default 45),
-`--x-tick` (chart gridline spacing, default 10), `--multiplier` (100),
-`--price-range` (±10% flip-search window), `--steps` (grid resolution),
-`--call-sign`/`--put-sign` (raw sign overrides), `--no-plot`, `--out-prefix`,
-`--callback`, `--token-path`. See `python3 gex.py --help`.
+**Flags:** `--ticker` · `--expiry` · `--all-days` (default 45; wider risks a vendor 502) · `--rate` ·
+`--div-yield` (auto per-ticker if omitted) · `--multiplier` · `--price-range` (±10% flip window) ·
+`--steps` · `--convention` / `--call-sign` / `--put-sign` · `--x-tick` (chart gridlines, default 10) ·
+`--no-plot` · `--out-prefix` · `--levels-only` · `--token-path` · `--demo`. Full list: `python3 gex.py --help`.
+
+### When to run what
+
+| Cadence | Command | Why |
+|---|---|---|
+| **Daily** (pre-open) | `gex.py --ticker SPY` | The day's levels. OI updates overnight, so run once before the open. |
+| **Weekly** (Mon) | `--expiry all --all-days 90` | Structural levels into the next quarter. |
+| **Weekly** (auth) | `scripts/schwab_setup.py` | **Required** — the 7-day refresh token dies otherwise. |
+| **Monthly** (OpEx) | `--expiry <3rd Friday>` | Monthly OpEx holds the bulk of OI; levels reset after it. |
+| **Quarterly** | `--rate <current> --div-yield <current>` | Triple witching, plus refresh your rate/yield assumptions. |
 
 ---
 
-## Command cheat-sheet (by cadence)
+## Mobile app
 
-> **Interpreter note (this machine):** the *live* interpreter is
-> `/opt/anaconda3/bin/python` (Python 3.13 with `schwab-py`). The bare `python3` and
-> the `.venv` are 3.9 — use those only for `--demo`/tests. Set a shortcut and load
-> credentials once per terminal:
-> ```bash
-> PY=/opt/anaconda3/bin/python
-> cd /Users/brendanhan/Desktop/Quant_Projects/gamma_exposure
-> set -a; source .env; set +a
-> ```
+`server.py` wraps the core in a local HTTP API (FastAPI, port **8787**) and serves an installable iPhone app
+from `static/` — same math, live data, deliberately minimal:
 
-**One-time — setup**
+1. **Pick the underlying** — SPY or QQQ (two large buttons).
+2. **Pick the options expiry** — a real listed-expirations picker (`Fri, Aug 7`), plus *All expiries (45d)*
+   and *0DTE only*. Already-settled dates are excluded automatically.
+3. **Tap `GET FRESH LEVELS`** — a live pull that **bypasses the server cache** (`fresh=1`), so spot and IV
+   are current every time. The fetch timestamp is shown under the button.
+
+Results: regime banner (green long-gamma / red short-gamma) with LOW-CONFIDENCE badge, spot, gamma flip
+(with SPX cross-quote for SPY), net GEX, both walls, a per-strike canvas chart with spot/flip/wall markers,
+and the expiry-bucket table.
+
 ```bash
-pip install -r requirements.txt      # deps (schwab-py auto-skipped on 3.9; needs 3.10+ live)
-cp .env.example .env                  # then fill in SCHWAB_APP_KEY / SCHWAB_APP_SECRET
-$PY scripts/schwab_setup.py           # first OAuth login -> writes .schwab_token.json
+python3 server.py
 ```
 
-**Daily — before the open (get the day's levels)**
-```bash
-$PY gex.py --ticker QQQ                # 0DTE + all-expiries: prints levels, saves chart
-$PY gex.py --ticker SPY                # SPY instead of QQQ
-$PY gex.py --ticker QQQ --expiry 0dte  # just today's 0DTE view
-$PY gex.py --ticker QQQ --no-plot      # text only (faster, no chart)
-```
-Check the printed `OI reflects [date]` line — it should read yesterday's session.
+On your iPhone (same Wi-Fi): open `http://<mac-lan-ip>:8787` in Safari → Share → **Add to Home Screen**.
+Your ticker and expiry choices persist between launches.
 
-**Weekly — re-authenticate (the refresh token expires ~7 days)**
-```bash
-$PY scripts/schwab_setup.py            # re-run the login (add --manual if the browser hangs)
-```
-If a daily run errors with a refresh-token / auth message, this is the fix.
+> **Intraday, honestly:** spot and IV are live, so levels do move during the session. **Open interest is
+> still from the prior close** — positions opened today, especially 0DTE, are not in it. The app states this
+> under every result rather than implying full real-time positioning.
 
-**Monthly — around monthly OpEx (3rd Friday)**
-```bash
-$PY gex.py --ticker QQQ --expiry 2026-08-21   # that monthly expiration's positioning
-$PY gex.py --ticker QQQ --all-days 60          # widen the window to catch the next monthly
-```
-The big walls reset after monthly OpEx — expect materially different levels the next week.
+**API:** `GET /api/gex?ticker=&expiry=both|0dte|all|YYYY-MM-DD&all_days=&fresh=0|1` ·
+`GET /api/expirations?ticker=` · `GET /api/health` · interactive docs at `/docs`.
 
-**Quarterly — triple-witching (3rd Fri of Mar/Jun/Sep/Dec) + refresh assumptions**
-```bash
-$PY gex.py --ticker QQQ --rate 0.043 --div-yield 0.013   # update r and q to current values
-pip install -U -r requirements.txt                        # refresh dependencies
-```
+Results cache for 60s unless `fresh=1`; the server rebuilds its Schwab client when the token file changes, so
+it heals itself after a re-login with no restart. LAN-only by default — for remote access, use Tailscale on
+both devices.
 
-**Any time — reference / sanity**
-```bash
-$PY gex.py --demo                       # offline synthetic sample (no credentials)
-$PY gex.py --ticker QQQ --x-tick 25     # chart gridlines every 25 instead of 10
-$PY gex.py --ticker QQQ --convention flipped   # sensitivity: flip the dealer-sign assumption
-$PY gex.py --help                       # every flag
-$PY -m pytest test_gex.py               # run the test suite
-```
-
----
-
-## Mobile app (live levels on your iPhone)
-
-`server.py` wraps `gex.py` in a local HTTP API (FastAPI, port **8787**) and serves
-a mobile web app from `static/` — same math, same filters, live data, with a
-**configurable ticker and a real expiration picker** (already-settled dates are
-excluded automatically). Results are cached 60s per query so refreshes don't
-hammer Schwab; on auth errors the server heals itself after you re-run
-`scripts/schwab_setup.py` (no restart needed).
-
-**Start it** (or install the always-on service below):
-```bash
-/opt/anaconda3/bin/python server.py
-```
-
-**On your iPhone** (same Wi-Fi): open **http://192.168.1.166:8787** in Safari →
-Share → **Add to Home Screen** → it installs as a standalone dark-mode app with
-ticker chips, expiry picker, regime banner, level cards, per-strike chart
-(gridlines every 10), and the hedging-urgency bucket table.
-
-**Always-on service** (starts at login, restarts on crash):
+**Always-on service:**
 ```bash
 cp scripts/com.brendanhan.gex-server.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-server.plist
 ```
 
-API (for any future native client): `GET /api/gex?ticker=QQQ&expiry=both|0dte|all|YYYY-MM-DD`,
-`GET /api/expirations?ticker=`, `GET /api/health`; interactive docs at `/docs`.
+---
 
-Notes: LAN-only by default (behind your router). For access away from home, put
-Tailscale on the Mac + phone and use the Mac's Tailscale address. Chain fetches
-carry a 90s hard deadline (`GEX_FETCH_DEADLINE`) — a trickling Schwab response
-can otherwise stall for many minutes.
+## Scheduled push notifications
 
-## Automation → your phone (macOS launchd)
+`scripts/daily_gex.sh <cadence>` runs the tool for each ticker and pushes levels + charts to your phone via
+**ntfy**, **Pushover**, or **Telegram** (whichever credentials are in `.env`).
 
-Pushes **SPY + QQQ** levels + charts to your iPhone on three cadences, each looking
-progressively further out. `scripts/daily_gex.sh <cadence>` does the run + push;
-one launchd plist per cadence schedules it:
-
-| Cadence | When (CT / ET) | Window | Plist |
+| Cadence | Schedule (CT / ET) | Window | Plist |
 |---|---|---|---|
-| **daily**   | Mon–Fri 07:45 / 08:45 | `--all-days 45`  | `com.brendanhan.gex-daily.plist` |
-| **weekly**  | Monday 07:50 / 08:50  | `--all-days 90`  | `com.brendanhan.gex-weekly.plist` |
-| **monthly** | 1st of month 07:55    | `--all-days 150` | `com.brendanhan.gex-monthly.plist` |
+| daily | Mon–Fri 07:45 / 08:45 | 45 days | `com.brendanhan.gex-daily.plist` |
+| weekly | Monday 07:50 / 08:50 | 90 days | `com.brendanhan.gex-weekly.plist` |
+| monthly | 1st of month 07:55 | 150 days | `com.brendanhan.gex-monthly.plist` |
 
-(Tickers/windows are overridable in `.env`: `GEX_TICKERS`, `GEX_{DAILY,WEEKLY,MONTHLY}_DAYS`,
-`GEX_SEND_CHARTS`.)
-
-**1. Pick a notifier** and add its keys to `.env` (see `.env.example`) — choose one:
-- **Pushover** — polished, sends the chart image: `PUSHOVER_TOKEN` + `PUSHOVER_USER`.
-- **Telegram** — free, private, sends the chart: `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`.
-- **ntfy.sh** — free, no account: install the ntfy app, subscribe to a hard-to-guess
-  topic → set `NTFY_TOPIC`.
-
-**2. Test each cadence by hand:**
 ```bash
-bash scripts/daily_gex.sh daily      # or weekly / monthly
-tail -n 20 logs/daily_gex.log        # shows it ran + which notifier was used
-```
-
-**3. Install the schedules** (repeat the cp + bootstrap for each plist):
-```bash
-for c in daily weekly monthly; do
+bash scripts/daily_gex.sh daily        # test by hand
+for c in daily weekly monthly; do      # install the schedules
   cp scripts/com.brendanhan.gex-$c.plist ~/Library/LaunchAgents/
   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-$c.plist
 done
 ```
-Remove any with `launchctl bootout gui/$(id -u)/com.brendanhan.gex-<cadence>`.
 
-Notes:
-- The Mac must be **awake** at fire time (launchd runs a missed job on next wake; a
-  powered-off Mac skips it). Project must be under a folder `/bin/bash` has
-  **Full Disk Access** to (System Settings → Privacy & Security).
-- If a run **fails** (e.g. the weekly Schwab token expired), you still get a push
-  titled "RUN FAILED" — your cue to re-run `scripts/schwab_setup.py`.
-- On a Monday-the-1st all three fire (daily + weekly + monthly) — expected.
-- Market **holidays aren't skipped** — you'll just get the prior session's (stale) levels.
+Tickers and windows are overridable in `.env` (`GEX_TICKERS`, `GEX_{DAILY,WEEKLY,MONTHLY}_DAYS`,
+`GEX_SEND_CHARTS`). Failure is itself a notification: titles distinguish success, `PARTIAL (1/2 ok)`,
+`RUN FAILED`, and `SCHWAB TOKEN EXPIRED`.
+
+**Notes:** the Mac must be awake at fire time (launchd runs a missed job on next wake). `/bin/bash` needs
+**Full Disk Access** if the project lives under `~/Desktop` (System Settings → Privacy & Security).
+Market holidays are not skipped — you get the prior session's levels.
 
 ---
 
-## Methodology (the part that matters)
+## Methodology
 
-**1. BSM (Merton) gamma** — identical for calls and puts, computed from Schwab's IV:
+### 1. BSM (Merton) gamma — identical for calls and puts
 
 ```
 gamma = exp(-q*T) * phi(d1) / (S * sigma * sqrt(T))
-d1    = [ ln(S/K) + (r - q + 0.5*sigma^2) * T ] / (sigma * sqrt(T))
+d1    = [ ln(S/K) + (r - q + sigma^2/2) * T ] / (sigma * sqrt(T))
 ```
 
-(The `exp(-q*T)` dividend discount is part of the closed form; with the default
-`q=0` it reduces to classic BSM.)
+- **σ is per-strike vendor IV.** The smile is **never** flattened to a single ATM vol — flattening destroys
+  wing gamma and is the most common silent GEX bug.
+- **`T` is calendar ACT/365** to **16:00 ET** (PM settlement at the cash close), *deliberately* not
+  trading-time. Gamma depends on σ²·T, and vendor IV is annualized on a calendar clock; pairing it with a
+  `390×252` clock breaks that pairing and inflates 0DTE gamma severalfold. A trading-time clock is correct
+  only when IV is re-derived under the same clock.
+- **`T` is floored at 5 minutes**, because gamma carries `S·σ·√T` in the denominator and diverges as `T → 0`.
+- **`q` auto-resolves per ticker** (SPY 1.2%, QQQ 0.6%) with its provenance printed; `r` defaults to 0.043
+  and is always echoed.
+- **Exercise style:** European gamma is used for American ETF options. The early-exercise premium
+  concentrates in deep-ITM (low-gamma) strikes and is small for the short-dated flow that dominates GEX.
 
-`S`=spot, `K`=strike, `sigma`=**per-strike** implied vol (Schwab IV — the smile is
-never flattened to a single ATM vol; flattening destroys wing gamma and is the
-most common silent GEX bug), `T`=time-to-expiry in years (**calendar** ACT/365 to
-**16:00 ET** — deliberately matched to the vendor IV's clock; pairing vendor sigma
-with a trading-time `390×252` clock would break the `sigma²·T` total-variance
-pairing and inflate 0DTE gamma severalfold), `r`=risk-free (`--rate`),
-`q`=dividend yield (auto per-ticker: SPY 1.2%, QQQ 0.6%; override `--div-yield`).
-`T` is floored at 5 minutes so ATM 0DTE gamma stays finite near the close.
-
-Exercise style: European (BSM) gamma is used for **all** contracts. SPY/QQQ are
-American; the early-exercise premium is ignored — it concentrates in deep-ITM
-(low-gamma) strikes and is small for the short-dated flow that dominates GEX.
-
-**Quote filters** ("garbage IV → garbage gamma"): crossed quotes (bid > ask) are
-dropped anywhere; **deep-ITM** contracts (>5% in the money) with **no bid** or a
-**relative spread > 25%** are dropped — their IV is extracted from a sliver of
-extrinsic value and is noise. Deep-**OTM** wings are *never* quote-filtered
-(zero-bid wings still carry real tail gamma via the ask-side IV). Zero-OI strikes
-are always dropped. All drop counts are printed.
-
-**2. Dollar GEX per contract** — "dollar gamma per 1% move":
+### 2. Dollar GEX per contract
 
 ```
 GEX = gamma * open_interest * multiplier * S^2 * 0.01
 ```
 
-= the dollar change in the aggregate (delta) position for a +1% move in spot.
+= the dollar change in aggregate dealer delta for a **+1% move** in spot.
 
-> **Unit warning:** this is the **per-1%** convention. Per-**point** GEX =
-> `gamma·OI·mult·S` (= per-1% ÷ `0.01·S`). SqueezeMetrics' published series is
-> per-point; most retail charts are per-1%. Comparing them raw is a category error.
+> **Unit warning:** this is the **per-1%** convention. Per-**point** GEX is `gamma·OI·mult·S`
+> (= per-1% ÷ `0.01·S`). SqueezeMetrics publishes per-point; most retail charts publish per-1%. Comparing
+> them raw is a category error.
 
-**3. Dealer sign convention — the model's single biggest assumption, not a fact.**
-Default = *standard*: dealers **long call gamma (+)**, **short put gamma (−)**:
+### 3. Dealer sign convention — the biggest assumption, not a fact
+
+Default (*standard*): dealers **long call gamma (+)**, **short put gamma (−)**.
 
 ```
 net GEX = SUM_calls(GEX) - SUM_puts(GEX)
 ```
 
-Flippable via `--convention flipped` or `--call-sign/--put-sign`.
+Flippable via `--convention flipped` or `--call-sign` / `--put-sign`. Ground truth would require
+dealer-direction data (e.g. CBOE open-close), which this feed does not provide — so the tool quantifies its
+exposure to the assumption instead of pretending.
 
-**4. Gamma flip / zero-gamma level.** Total net GEX is **repriced across a grid of
-hypothetical spot prices** (±10% by default), recomputing gamma *and* the `S^2`
-term at each. The flip is where the total crosses zero; the curve can have
-**multiple crossings** — all are detected, the one nearest spot is reported and
-the rest are listed. Reported in SPX and SPY-equivalent (live SPX/SPY ratio).
-Repricing holds each strike's IV fixed (**sticky-strike**); reality sits between
-sticky-strike and sticky-delta, so the flip is an estimate under a stated
-vol-dynamics assumption, not a model-free level.
+### 4. Gamma flip — found by root-finding, not lookup
 
-**5. Walls.** Call wall = strike with the largest **positive** net GEX (pin /
-resistance). Put wall = strike with the largest **negative** net GEX (support
-that becomes a downside accelerant once breached).
+Total net GEX is **repriced across a 1,000-point grid of hypothetical spot prices** (±10%), recomputing both
+`Γ(S')` **and** the `S'²` dollar term at each node. Sign changes between adjacent nodes are resolved by
+linear interpolation:
 
-**6. Regime.** `spot > flip` → dealers net **long gamma** (vol-dampening,
-mean-reverting). `spot < flip` → net **short gamma** (vol-amplifying, trend-prone).
+```
+x = x0 - y0 * (x1 - x0) / (y1 - y0)
+```
+
+The curve can legitimately cross zero **more than once** — all crossings are detected, the nearest to spot
+is reported, and the rest are listed. Repricing holds each strike's IV fixed (**sticky-strike**); reality
+sits between sticky-strike and sticky-delta, so the flip is an estimate under a stated vol-dynamics
+assumption, not a model-free level.
+
+### 5. Walls and regime
+
+| Output | Definition | Meaning |
+|---|---|---|
+| **Call wall** | Strike with the largest **positive** net GEX | Resistance / pin |
+| **Put wall** | Strike with the largest **negative** net GEX | Support that becomes a downside **accelerant** if breached |
+| **Regime** | `spot > flip` → LONG gamma<br>`spot < flip` → SHORT gamma | Long: vol-damping, mean-reverting.<br>Short: vol-amplifying, trend-prone. |
 
 ---
 
-## Key outputs
+## Uncertainty & guardrails (built in, not optional)
 
-1. Total net dealer GEX (`$/1% move`) — 0DTE vs all expiries, side by side.
-2. Gamma flip level (SPX + SPY-equivalent).
-3. Call wall and 4. put wall.
-5. Per-strike GEX profile chart (PNG) with flip, walls, and spot marked.
-6. A plain-text bias summary with a one-line interpretation.
-
-## Uncertainty / guardrails (built in, not optional)
-
-- **Put-sign sensitivity.** The flip is recomputed under the literal put-sign
-  flip (which usually makes *all* gamma positive — i.e. the flip vanishes, an
-  honest signal that the flip exists *only* under the short-put assumption) and
-  under a graded **±50% change in the short-put magnitude**, which yields an
-  actual "how far does it move" number. A **LOW CONFIDENCE** warning prints when
-  the flip is materially sensitive (> 1% of spot).
-- **OI staleness.** Open interest updates only once per day (overnight, OCC EOD).
-  The tool prints the reference date and a clear caveat that **0DTE GEX lags**
-  intraday positioning (today's freshly-opened 0DTE flow is *not* in this OI).
-- **Gamma by expiry (hedging urgency).** The all-expiry total is decomposed into
-  0DTE / ≤1 week / ≤ monthly OpEx / beyond, with gross share and net GEX per
-  bucket — so you can see how much of the headline number is slow OI.
-- **Thin/missing data.** Contracts with no OI, no IV, crossed quotes, or
-  deep-ITM garbage quotes are dropped (counts reported); expired contracts are
-  dropped; it never crashes on a sparse chain.
+- **Put-sign sensitivity.** The flip is recomputed under the literal sign flip (which usually makes *all*
+  gamma positive, i.e. the flip vanishes — an honest signal that it exists *only* under the short-put
+  assumption) **and** under a graded **±50% change in short-put magnitude**, which yields an actual "how far
+  does it move" number. A **LOW CONFIDENCE** warning prints when the flip moves more than **1% of spot**.
+- **OI staleness.** Open interest updates once daily (overnight, OCC EOD). The reference date is printed
+  with a clear caveat that **0DTE GEX lags** — today's freshly-opened 0DTE flow is *not* in this OI.
+- **Gamma by expiry.** The hedging-urgency decomposition shown above.
+- **Quote-quality filters.** Crossed quotes (bid > ask) dropped anywhere; **deep-ITM** contracts (>5% ITM)
+  with no bid or a relative spread >25% dropped — their IV comes from a sliver of extrinsic value and is
+  noise. **Deep-OTM wings are never quote-filtered**: zero-bid wings still carry real tail gamma. Zero-OI
+  strikes always dropped. All drop counts printed.
+- **Never crashes on a thin chain.** Degenerate inputs return 0, never NaN or infinity.
 
 ## The governing rule: match the expiry set to your holding period
 
-This is the discipline almost nobody applies. GEX from the wrong expiry set is
-noise for your horizon:
+The discipline almost nobody applies. GEX from the wrong expiry set is noise for your horizon:
 
-| Your horizon | Use | Reality check |
+| Horizon | Use | Reality check |
 |---|---|---|
-| **Intraday / 0DTE** | `--expiry 0dte` | **Prior-close OI is stale for 0DTE** — those positions open and close intraday; real-time signed volume (not available here) is what actually drives it. 0DTE gamma is enormous and **evaporates at 16:00 ET daily**. |
-| **Daily swing** | default (45d all-expiry) | Use as a **regime classifier, not an entry trigger**. |
-| **Weekly/monthly** | weekly push (90d) | **Monthly OpEx (3rd Friday) holds the bulk of index OI.** Charm/vanna dominate into roll-off — not modeled here. Watch levels reset after OpEx. |
-| **Quarterly** | monthly push (150d) | **Triple witching** (Mar/Jun/Sep/Dec) = the biggest structural resets. |
-| **Longer** | — | LEAPS gamma per contract is negligible; **vanna carries** — a gamma tool is the wrong lens. |
+| **Intraday / 0DTE** | `--expiry 0dte` | **Prior-close OI is stale here** — 0DTE positions open and close intraday; real-time signed volume (not available on this feed) is what actually drives it. 0DTE gamma **evaporates at 16:00 ET daily**. |
+| **Daily swing** | default (45d) | A **regime classifier, not an entry trigger**. |
+| **Weekly/monthly** | 90d window | **Monthly OpEx holds the bulk of OI.** Charm/vanna dominate into roll-off — not modeled here. |
+| **Quarterly** | 150d window | **Triple witching** = the biggest structural resets. |
+| **Longer** | — | LEAPS gamma per contract is negligible; **vanna carries** — wrong tool. |
 
-If you day-trade off an all-expirations chart, part of that number is 6-month OI
-that will **not** be rebalanced today — that's exactly what the GAMMA BY EXPIRY
-table decomposes. Weight by hedging urgency, not magnitude alone.
+If you day-trade off an all-expirations chart, part of that number is six-month OI that will **not** be
+rebalanced today. Weight by hedging urgency, not magnitude alone.
+
+---
 
 ## Limitations (read before trading on this)
 
-- The dealer sign convention is an **assumption**, and the flip's *existence*
-  depends on it. This is the biggest weakness — treat the regime as directional
-  context, not a precise tradeable level.
-- OI is end-of-prior-session; the intraday 0DTE picture is necessarily stale.
-- **Single-underlying scope.** A full S&P-complex dealer book aggregates
-  SPX + SPXW + XSP + SPY + ES normalized to common notional. Schwab has no index
-  OI and no futures options, so this tool measures **one listed underlying's**
-  gamma (SPY or QQQ) — a correlated *proxy* for the complex, not its total.
-  Raw GEX is deliberately never summed across underlyings.
-- Uses Schwab's per-strike IV as input; quote filters catch the worst garbage,
-  but garbage IV in → garbage gamma out still applies.
-- Sticky-strike repricing and European-exercise gamma are stated approximations.
-- Dealer-direction data (e.g. CBOE open-close) is not available via Schwab, so
-  the sign convention stays an assumption with a sensitivity band.
-- `q` auto-fills from a built-in per-ticker map (SPY 1.2%, QQQ 0.6%); pass
-  `--div-yield` for precision (e.g. around special distributions).
-- Schwab OAuth needs a one-time browser login and an **approved** developer app
-  (approval can take days); `schwab-py` auto-refreshes the ~30-min access token,
-  but the ~7-day refresh token requires re-running `scripts/schwab_setup.py`.
-- The live Schwab path needs **Python ≥ 3.10** (`schwab-py`); `--demo` and the
-  tests run on 3.9.
+- The **dealer sign convention is an assumption**, and the flip's *existence* depends on it. Biggest
+  weakness — treat the regime as directional context, not a precise tradeable level.
+- **OI is end-of-prior-session**; the intraday 0DTE picture is necessarily stale.
+- **Single-underlying scope.** A full S&P dealer book aggregates SPX + SPXW + XSP + SPY + ES normalized to
+  common notional. Schwab has no index OI and no futures options, so this measures **one listed underlying**
+  as a correlated proxy. Raw GEX is deliberately never summed across underlyings.
+- **Charm and vanna are not modeled** — they dominate into monthly OpEx roll-off.
+- Uses vendor per-strike IV; quote filters catch the worst, but garbage IV in → garbage gamma out.
+- **Sticky-strike** repricing and **European-exercise** gamma are stated approximations.
+- Schwab OAuth needs an **approved** developer app and a **weekly** browser re-login.
+
+---
+
+## Repository map
+
+| Path | Lines | Role |
+|---|---|---|
+| `gex.py` | 1,489 | Quant core + Schwab data layer + rendering + CLI |
+| `test_gex.py` | 447 | 25 pytest cases (no network) |
+| `server.py` | 373 | FastAPI JSON API, caching, client lifecycle |
+| `static/index.html` | 262 | Installable iOS PWA |
+| `scripts/schwab_setup.py` | 145 | One-time OAuth login + live verification |
+| `scripts/daily_gex.sh` | 110 | Multi-cadence notifier |
+| `scripts/*.plist` | 4 files | launchd agents (3 push cadences + API server) |
+| `GEX_Technical_Reference.pdf` | 20 pp | Full technical documentation |
 
 ## Tests
 
 ```bash
-python3 -m pytest test_gex.py -v
+python3 -m pytest test_gex.py -v      # 25 tests, < 1s, no network
 ```
 
-Covers BSM gamma against known reference values (a clean closed-form case and
-Hull's textbook example) and `find_flip_level` against a synthetic chain whose
-zero-gamma crossing is derived in closed form (see the derivation in the test).
+Validation is against **independently derived truth**, not recorded output:
+
+- **BSM gamma** vs a hand-computed closed form (asserted to 1e-9), **Hull's textbook example**
+  (`S=49, K=50, r=0.05, σ=0.20, T=20/52 → Γ ≈ 0.066`), and a construction where `d₁ = 0` exactly to isolate
+  the `exp(-q·T)` factor (1e-12).
+- **`find_flip_level`** against a hand-derived analytical crossing: for one call at `Kc` and one put at `Kp`
+  with equal OI and matching σ/T, the common factors cancel at the zero, giving
+  `S* = √(Kc·Kp)·e^(-cT)` — the grid search must land on **97.5288**.
+- Plus: quote-filter behavior (including **wing preservation**), OpEx calendar arithmetic, retry
+  classification (transient vs. auth), and cross-process token-lock exclusivity via a real subprocess.

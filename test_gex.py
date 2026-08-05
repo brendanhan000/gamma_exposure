@@ -11,6 +11,7 @@ Two things are worth testing hard because everything else rides on them:
 No network is touched.
 """
 import math
+import os
 from datetime import date
 
 import numpy as np
@@ -286,6 +287,32 @@ def test_div_yield_per_ticker_map():
     assert build_config(parse_args(["--ticker", "QQQ", "--div-yield", "0.01"])).div_yield == 0.01
 
 
+def test_explain_empty_view_distinguishes_expired_from_missing():
+    # An empty 0DTE view after 16:00 ET is CORRECT (the options settled), not a
+    # failure. The message must say which, so the user does not think it broke.
+    import gex
+    from datetime import datetime
+
+    et = gex._et_tz()
+    wed = date(2026, 8, 5)                       # a Wednesday
+
+    after_close = datetime(2026, 8, 5, 23, 18, tzinfo=et)
+    msg = gex.explain_empty_view("0DTE", wed, now=after_close)
+    assert "settled at 16:00" in msg and "7h 18m" in msg
+
+    before_close = datetime(2026, 8, 5, 10, 0, tzinfo=et)
+    msg2 = gex.explain_empty_view("0DTE", wed, now=before_close)
+    assert "usable OI" in msg2 and "settled" not in msg2   # still live -> thin data
+
+    sat = date(2026, 8, 8)
+    assert "weekend" in gex.explain_empty_view("0DTE", sat,
+                                               now=datetime(2026, 8, 8, 10, 0, tzinfo=et))
+
+    # Non-0DTE labels get their own wording, never the 16:00 story.
+    assert "16:00" not in gex.explain_empty_view("ALL EXPIRIES", wed, now=after_close)
+    assert "settled" in gex.explain_empty_view("EXPIRY 2026-08-04", wed, now=after_close)
+
+
 def test_monthly_opex_calendar():
     assert third_friday(2026, 7) == date(2026, 7, 17)
     assert third_friday(2026, 8) == date(2026, 8, 21)
@@ -354,6 +381,70 @@ def test_fetch_chain_does_not_retry_auth_or_4xx():
     with pytest.raises(_HttpErr):
         fetch_chain_schwab(n, "SPY", retry_wait=0.0)
     assert n.calls == 1
+
+
+def test_token_lock_is_exclusive_across_processes(tmp_path):
+    # The lock must actually exclude a second holder (Schwab rotates the refresh
+    # token on refresh; concurrent refreshes revoke each other).
+    import gex
+    import os
+    import subprocess
+    import sys
+    import time
+
+    tok = tmp_path / "tok.json"
+    tok.write_text("{}")
+    with gex.token_lock(str(tok)):
+        # A separate PROCESS must fail to take the same flock while we hold it.
+        code = (
+            "import fcntl,sys\n"
+            "f=open(%r,'a+')\n"
+            "try:\n"
+            "    fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); print('ACQUIRED')\n"
+            "except OSError: print('BLOCKED')\n" % (str(tok) + ".lock")
+        )
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        assert "BLOCKED" in out.stdout
+
+    # Released afterwards.
+    out2 = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert "ACQUIRED" in out2.stdout
+
+
+def test_token_lock_timeout_proceeds_unlocked(tmp_path):
+    # A stuck lock must NOT hard-fail the run (outage > race).
+    import gex
+    tok = tmp_path / "t.json"
+    tok.write_text("{}")
+    ran = []
+    with gex.token_lock(str(tok), timeout=0.0):
+        with gex.token_lock(str(tok), timeout=0.05):   # cannot acquire; proceeds
+            ran.append(True)
+    assert ran == [True]
+
+
+def test_schwab_client_stale_detects_rewritten_token(tmp_path):
+    # A long-lived holder must notice the token file was replaced by a re-login.
+    import gex
+    import time
+
+    tok = tmp_path / "tok.json"
+    tok.write_text('{"token": {}}')
+
+    class _C:
+        pass
+
+    c = _C()
+    c._gex_token_path = str(tok)
+    c._gex_token_mtime = gex._token_mtime(str(tok))
+    assert gex.schwab_client_stale(c) is False
+
+    time.sleep(0.01)
+    os.utime(str(tok), (time.time() + 5, time.time() + 5))   # simulate re-login
+    assert gex.schwab_client_stale(c) is True
+
+    # A client with no stamped path (not built by get_schwab_client) is inert.
+    assert gex.schwab_client_stale(_C()) is False
 
 
 def test_get_schwab_client_errors_without_creds_or_token(tmp_path):

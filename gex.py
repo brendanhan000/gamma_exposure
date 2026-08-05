@@ -133,10 +133,12 @@ import warnings
 warnings.filterwarnings("ignore", message=r".*OpenSSL.*", module="urllib3")
 
 import argparse
+import fcntl
 import math
 import os
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, date, timezone, timedelta
 
@@ -470,6 +472,80 @@ def to_schwab_symbol(ticker):
     return SCHWAB_INDEX_SYMBOLS.get(t, t)
 
 
+# ---------------------------------------------------------------------------
+# Token sharing safety (multi-process)
+# ---------------------------------------------------------------------------
+# Schwab ROTATES the refresh token on every refresh and treats presentation of a
+# superseded refresh token as a compromise -> it revokes the whole token family.
+# This project has several processes sharing ONE token file (the always-on
+# server, the launchd push jobs, manual CLI runs), which creates two hazards:
+#
+#   1. STALE IN-MEMORY TOKEN: a long-lived process (server.py) caches a client
+#      built from the token file. After any other login/refresh rewrites that
+#      file, the cached client still holds the OLD refresh token; the next time
+#      it refreshes it presents a superseded token and kills the new one too.
+#      -> Fix: schwab_client_stale() lets holders notice the file changed and
+#         rebuild. (Observed live: a server started Jul 23 revoked an Aug 2 login.)
+#
+#   2. CONCURRENT REFRESH: two processes refreshing at once each rotate the
+#      token, invalidating the other's. -> Fix: token_lock() serializes API calls
+#      across processes via an flock on a sidecar .lock file.
+def _token_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+@contextmanager
+def token_lock(token_path, timeout=120.0, poll=0.25):
+    """Cross-process exclusive lock guarding Schwab API calls (refresh rotation).
+
+    Uses a sidecar '<token>.lock' file so the token itself is never truncated.
+    On timeout it proceeds UNLOCKED rather than failing the run: a possible race
+    is better than a guaranteed outage.
+    """
+    if not token_path:
+        yield
+        return
+    lock_path = token_path + ".lock"
+    fh = None
+    locked = False
+    try:
+        fh = open(lock_path, "a+")
+        deadline = time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except (IOError, OSError):
+                if time.time() >= deadline:
+                    break
+                time.sleep(poll)
+        yield
+    finally:
+        if fh is not None:
+            if locked:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except (IOError, OSError):
+                    pass
+            fh.close()
+
+
+def schwab_client_stale(client):
+    """True if the token file changed on disk since `client` was built.
+
+    Long-lived holders MUST check this before use and rebuild when stale, or they
+    will eventually present a superseded refresh token and revoke the family.
+    """
+    path = getattr(client, "_gex_token_path", None)
+    if not path:
+        return False
+    return _token_mtime(path) != getattr(client, "_gex_token_mtime", None)
+
+
 def get_schwab_client(app_key, app_secret, token_path, callback=DEFAULT_CALLBACK):
     """Build a schwab-py client from a cached token file.
 
@@ -501,6 +577,10 @@ def get_schwab_client(app_key, app_secret, token_path, callback=DEFAULT_CALLBACK
         client.set_timeout(30.0)
     except Exception:
         pass
+    # Stamp the source file + its mtime so holders can detect a rewritten token
+    # (see schwab_client_stale) instead of presenting a superseded refresh token.
+    client._gex_token_path = token_path
+    client._gex_token_mtime = _token_mtime(token_path)
     return client
 
 
@@ -527,9 +607,13 @@ def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_coun
         kwargs["strike_count"] = strike_count
 
     last = None
+    tok_path = getattr(client, "_gex_token_path", None)
     for attempt in range(max_retries):
         try:
-            resp = client.get_option_chain(symbol, **kwargs)
+            # Serialized across processes: a refresh triggered inside this call
+            # rotates the shared refresh token (see token_lock).
+            with token_lock(tok_path):
+                resp = client.get_option_chain(symbol, **kwargs)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -647,7 +731,8 @@ def fetch_spx_spy_ratio(client, base_ticker, spot):
     """
     other = "SPY" if base_ticker == "SPX" else "$SPX"
     try:
-        resp = client.get_quote(other)
+        with token_lock(getattr(client, "_gex_token_path", None)):
+            resp = client.get_quote(other)
         resp.raise_for_status()
         q = ((resp.json().get(other) or {}).get("quote")) or {}
         px = q.get("lastPrice") or q.get("mark") or q.get("closePrice")
@@ -713,6 +798,30 @@ def compute_view(contracts, spot, cfg):
         "total": profile["total"],
         "gross": gross,
     }
+
+
+def explain_empty_view(label, today, now=None):
+    """Explain WHY a view has no contracts, instead of printing a bare '(empty)'.
+
+    The common case is not an error: after 16:00 ET the day's 0DTE options have
+    settled, so enrich_and_filter_time correctly drops them and the 0DTE view is
+    legitimately empty. Saying so beats leaving the user to wonder whether the
+    tool broke.
+    """
+    now = now_et() if now is None else now
+    if "0DTE" in label.upper():
+        if today.weekday() >= 5:
+            return "no expiration today (weekend)"
+        secs = seconds_to_expiry(today, now)
+        if secs <= 0:
+            ago = -secs
+            h, m = int(ago // 3600), int((ago % 3600) // 60)
+            return ("today's 0DTE settled at 16:00 ET ({}h {:02d}m ago) -- expired, "
+                    "not missing".format(h, m))
+        return "no 0DTE contracts with usable OI and IV in the chain"
+    if label.upper().startswith("EXPIRY"):
+        return "that expiration has settled, or has no contracts with usable OI and IV"
+    return "no contracts with usable OI and IV in this slice"
 
 
 def regime_word(spot, flip):
@@ -810,8 +919,12 @@ def print_data_health(spot, ts_ns, dropped, dropped_expired, floored, n_kept, to
     print()
 
 
-def print_side_by_side(views):
-    """Totals table across the computed views (e.g. 0DTE vs ALL)."""
+def print_side_by_side(views, today=None):
+    """Totals table across the computed views (e.g. 0DTE vs ALL).
+
+    Empty columns print a short reason (e.g. 'expired 16:00') rather than a bare
+    '(empty)', with the full explanation footnoted under the table.
+    """
     labels = [lbl for lbl, _ in views]
     print("-" * 78)
     print("NET DEALER GEX  ($ per 1% move)   [#1 KEY OUTPUT]")
@@ -819,16 +932,26 @@ def print_side_by_side(views):
     header = "  {:<26}".format("") + "".join("{:>22}".format(l) for l in labels)
     print(header)
 
+    def short_empty(lbl):
+        if today is not None and "0DTE" in lbl.upper() \
+                and today.weekday() < 5 and seconds_to_expiry(today, now_et()) <= 0:
+            return "(expired 16:00)"
+        return "(none)"
+
     def row(name, fn):
         cells = ""
-        for _, v in views:
-            cells += "{:>22}".format("(empty)" if v.get("empty") else fn(v))
+        for lbl, v in views:
+            cells += "{:>22}".format(short_empty(lbl) if v.get("empty") else fn(v))
         print("  {:<26}{}".format(name, cells))
 
     row("Total net GEX", lambda v: fmt_bn(v["total"]))
     row("Total net GEX ($)", lambda v: fmt_usd(v["total"]))
     row("Gross |gamma| ($/1%)", lambda v: fmt_bn(v["gross"]))
     row("Contracts", lambda v: str(v["n"]))
+    if today is not None:
+        for lbl, v in views:
+            if v.get("empty"):
+                print("  * {}: {}".format(lbl, explain_empty_view(lbl, today)))
     print()
 
 
@@ -842,12 +965,12 @@ def cross_quote(ticker, value, spy_ratio):
     return None
 
 
-def print_view_detail(label, view, spot, spy_ratio, cfg):
+def print_view_detail(label, view, spot, spy_ratio, cfg, today):
     print("-" * 78)
     print("VIEW: {}".format(label))
     print("-" * 78)
     if view.get("empty"):
-        print("  No usable contracts in this slice (thin/empty chain).")
+        print("  No levels: {}.".format(explain_empty_view(label, today)))
         print()
         return
 
@@ -923,13 +1046,15 @@ def print_view_detail(label, view, spot, spy_ratio, cfg):
     print()
 
 
-def render_summary(label, view, spot, spy_ratio, cfg):
+def render_summary(label, view, spot, spy_ratio, cfg, today):
     """The required plain-text bias block (#6)."""
     print("#" * 78)
     print("# BIAS SUMMARY  --  {}".format(label))
     print("#" * 78)
     if view.get("empty"):
-        print("  (no data)")
+        print("  No bias: {}.".format(explain_empty_view(label, today)))
+        if "0DTE" in label.upper():
+            print("  Use the ALL EXPIRIES view for tonight; fresh 0DTE appears after tomorrow's open.")
         print("#" * 78)
         print()
         return
@@ -1214,7 +1339,7 @@ def render_levels_compact(label, view, spot, spy_ratio, cfg, today):
     """Compact, stable levels block for --levels-only (notifications / quick pulls)."""
     oi_date = prior_trading_session(today).isoformat()
     if view.get("empty"):
-        print("{} | {}: no usable contracts (empty/thin chain).".format(cfg.ticker, label))
+        print("{} | {}: {}".format(cfg.ticker, label, explain_empty_view(label, today)))
         print()
         return
     flip = view["flip_std"]["flip"]
@@ -1246,7 +1371,7 @@ def run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
         print_assumptions(cfg, rate_is_default)
         print_data_health(spot, ts_ns, dropped, dropped_expired, floored,
                            len(all_contracts), today, prior_trading_session(today))
-        print_side_by_side(computed)
+        print_side_by_side(computed, today)
 
         # Hedging-urgency decomposition of the all-expiries population (the
         # governing rule: match the expiry set to the holding period).
@@ -1255,9 +1380,9 @@ def run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
             print_gamma_buckets(all_cs, spot, cfg, today)
 
         for lbl, view in computed:
-            print_view_detail(lbl, view, spot, spy_ratio, cfg)
+            print_view_detail(lbl, view, spot, spy_ratio, cfg, today)
         for lbl, view in computed:
-            render_summary(lbl, view, spot, spy_ratio, cfg)
+            render_summary(lbl, view, spot, spy_ratio, cfg, today)
 
     if not args.no_plot:
         prefix = args.out_prefix or "gex_{}_{}".format(cfg.ticker.replace(":", ""), today.isoformat())

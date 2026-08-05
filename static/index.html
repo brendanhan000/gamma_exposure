@@ -2,261 +2,294 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="GEX">
 <meta name="theme-color" content="#0d1117">
 <link rel="manifest" href="/manifest.json">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <title>GEX Levels</title>
 <style>
-  :root {
-    --bg:#0d1117; --card:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e;
-    --green:#3fb950; --red:#f85149; --blue:#58a6ff; --amber:#d29922;
+  :root{
+    --bg:#0d1117; --card:#161b22; --card2:#1c232c; --line:#30363d; --fg:#e6edf3;
+    --dim:#8b949e; --green:#3fb950; --red:#f85149; --blue:#58a6ff; --amber:#d29922;
   }
-  * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
-  body { background:var(--bg); color:var(--fg); font:15px/1.45 -apple-system,system-ui,sans-serif;
-         padding:max(env(safe-area-inset-top),10px) 12px 28px; max-width:560px; margin:0 auto; }
-  h1 { font-size:19px; display:flex; align-items:center; gap:8px; padding:6px 0 10px; }
-  h1 .dot { width:9px; height:9px; border-radius:50%; background:var(--dim); }
-  h1 .dot.ok { background:var(--green); } h1 .dot.bad { background:var(--red); }
-  h1 small { color:var(--dim); font-weight:400; font-size:12px; margin-left:auto; }
-  .row { display:flex; gap:8px; margin-bottom:10px; align-items:center; flex-wrap:wrap; }
-  .chip { border:1px solid var(--line); background:var(--card); color:var(--fg);
-          padding:8px 14px; border-radius:18px; font-size:14px; cursor:pointer; }
-  .chip.on { background:var(--blue); border-color:var(--blue); color:#04121f; font-weight:600; }
-  input,select,button { background:var(--card); color:var(--fg); border:1px solid var(--line);
-          border-radius:9px; padding:9px 10px; font-size:14px; }
-  input#tick { width:74px; text-transform:uppercase; }
-  select { flex:1; min-width:120px; }
-  button.go { background:var(--blue); color:#04121f; font-weight:700; border:none; padding:9px 16px; }
-  .banner { border-radius:12px; padding:12px 14px; margin:4px 0 10px; font-weight:700;
-            font-size:17px; display:none; }
-  .banner.long { display:block; background:rgba(63,185,80,.15); color:var(--green);
-                 border:1px solid rgba(63,185,80,.4); }
-  .banner.short { display:block; background:rgba(248,81,73,.13); color:var(--red);
-                  border:1px solid rgba(248,81,73,.4); }
-  .banner .sub { font-size:12.5px; font-weight:400; color:var(--fg); margin-top:5px; }
-  .badge { font-size:11px; padding:2px 8px; border-radius:9px; vertical-align:2px;
-           background:rgba(210,153,34,.18); color:var(--amber); border:1px solid rgba(210,153,34,.4); }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:10px 12px; }
-  .card .k { color:var(--dim); font-size:11.5px; text-transform:uppercase; letter-spacing:.4px; }
-  .card .v { font-size:19px; font-weight:700; margin-top:2px; font-variant-numeric:tabular-nums; }
-  .card .s { color:var(--dim); font-size:11.5px; margin-top:1px; }
-  .cw .v { color:var(--green); } .pw .v { color:var(--red); }
-  canvas { width:100%; height:230px; background:var(--card); border:1px solid var(--line);
-           border-radius:12px; margin-bottom:10px; }
-  table { width:100%; border-collapse:collapse; font-size:12.5px; margin-bottom:10px; }
-  th,td { text-align:right; padding:6px 8px; border-bottom:1px solid var(--line);
-          font-variant-numeric:tabular-nums; }
-  th:first-child,td:first-child { text-align:left; }
-  th { color:var(--dim); font-weight:500; font-size:11px; text-transform:uppercase; }
-  .meta { color:var(--dim); font-size:11.5px; line-height:1.7; }
-  .err { display:none; background:rgba(248,81,73,.12); border:1px solid rgba(248,81,73,.45);
-         color:var(--red); border-radius:12px; padding:11px 13px; margin-bottom:10px; font-size:13.5px; }
-  .warn { background:rgba(210,153,34,.12); border:1px solid rgba(210,153,34,.4); color:var(--amber);
-          border-radius:12px; padding:9px 12px; margin-bottom:10px; font-size:12.5px; }
-  .tabs { display:flex; gap:6px; margin-bottom:8px; }
-  .tabs .chip { padding:6px 12px; font-size:12.5px; }
-  #spin { display:none; color:var(--dim); font-size:12px; }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  body{background:var(--bg);color:var(--fg);
+       font:16px/1.45 -apple-system,system-ui,"SF Pro Text",sans-serif;
+       padding:max(env(safe-area-inset-top),12px) 14px calc(env(safe-area-inset-bottom) + 30px);
+       max-width:600px;margin:0 auto;-webkit-text-size-adjust:100%}
+  header{display:flex;align-items:center;gap:8px;padding:2px 0 14px}
+  header h1{font-size:20px;font-weight:700;letter-spacing:-.3px}
+  header .dot{width:9px;height:9px;border-radius:50%;background:var(--dim);flex:none}
+  header .dot.ok{background:var(--green)} header .dot.bad{background:var(--red)}
+  header .tok{margin-left:auto;font-size:11.5px;color:var(--dim)}
+
+  .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim);
+       margin:0 0 7px 2px;font-weight:600}
+  .seg{display:flex;gap:10px;margin-bottom:16px}
+  .seg button{flex:1;padding:15px 0;font-size:17px;font-weight:700;border-radius:13px;
+       border:1.5px solid var(--line);background:var(--card);color:var(--fg);letter-spacing:.3px}
+  .seg button.on{background:var(--blue);border-color:var(--blue);color:#04121f}
+
+  select{width:100%;padding:15px 14px;font-size:16px;font-weight:600;border-radius:13px;
+       border:1.5px solid var(--line);background:var(--card);color:var(--fg);
+       margin-bottom:16px;-webkit-appearance:none;appearance:none;
+       background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='9'><path d='M1 1l6 6 6-6' stroke='%238b949e' stroke-width='2' fill='none'/></svg>");
+       background-repeat:no-repeat;background-position:right 15px center}
+
+  #go{width:100%;padding:19px 0;font-size:18px;font-weight:800;letter-spacing:.4px;
+      border:none;border-radius:15px;background:var(--blue);color:#04121f;margin-bottom:6px}
+  #go:disabled{opacity:.55}
+  #go.busy{background:var(--card2);color:var(--dim)}
+  .stamp{text-align:center;font-size:11.5px;color:var(--dim);min-height:16px;margin-bottom:14px}
+
+  .err{display:none;background:rgba(248,81,73,.13);border:1px solid rgba(248,81,73,.45);
+       color:var(--red);border-radius:13px;padding:13px 15px;margin-bottom:14px;font-size:14px}
+  .warn{background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.4);color:var(--amber);
+       border-radius:13px;padding:11px 14px;margin-bottom:14px;font-size:13px}
+
+  .banner{border-radius:15px;padding:15px 16px;margin-bottom:14px;display:none}
+  .banner.on{display:block}
+  .banner .reg{font-size:21px;font-weight:800;letter-spacing:-.2px}
+  .banner.long{background:rgba(63,185,80,.14);border:1px solid rgba(63,185,80,.42)}
+  .banner.long .reg{color:var(--green)}
+  .banner.short{background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.42)}
+  .banner.short .reg{color:var(--red)}
+  .banner .txt{font-size:13.5px;color:var(--fg);margin-top:7px;opacity:.92}
+  .badge{display:inline-block;font-size:10.5px;font-weight:700;padding:3px 9px;border-radius:9px;
+       background:rgba(210,153,34,.2);color:var(--amber);border:1px solid rgba(210,153,34,.45);
+       vertical-align:3px;margin-left:7px}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px}
+  .card.wide{grid-column:1/-1}
+  .card .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);font-weight:600}
+  .card .v{font-size:24px;font-weight:800;margin-top:3px;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+  .card .s{font-size:11.5px;color:var(--dim);margin-top:2px}
+  .cw .v{color:var(--green)} .pw .v{color:var(--red)} .fl .v{color:var(--blue)}
+
+  canvas{width:100%;height:210px;background:var(--card);border:1px solid var(--line);
+       border-radius:14px;margin-bottom:14px;display:none}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;margin-bottom:14px;display:none}
+  th,td{text-align:right;padding:7px 6px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.5px;font-weight:600}
+  .foot{font-size:11.5px;color:var(--dim);line-height:1.65}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.25);
+       border-top-color:var(--dim);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px;margin-right:7px}
+  @keyframes sp{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
-<h1>Γ GEX Levels <span class="dot" id="dot"></span><span id="spin">updating…</span>
-    <small id="tok"></small></h1>
 
-<div class="row">
-  <span class="chip tk" data-t="SPY">SPY</span>
-  <span class="chip tk" data-t="QQQ">QQQ</span>
-  <input id="tick" placeholder="other" maxlength="6" autocapitalize="characters">
-  <select id="exp"><option value="both">0DTE + All (45d)</option></select>
-  <button class="go" id="go">Refresh</button>
-  <span class="chip" id="auto">auto 60s</span>
+<header>
+  <h1>Γ GEX Levels</h1><span class="dot" id="dot"></span>
+  <span class="tok" id="tok"></span>
+</header>
+
+<div class="lbl">Underlying</div>
+<div class="seg">
+  <button data-t="SPY" id="bSPY">SPY</button>
+  <button data-t="QQQ" id="bQQQ">QQQ</button>
 </div>
+
+<div class="lbl">Options expiry</div>
+<select id="exp"><option value="all">Loading expirations…</option></select>
+
+<button id="go">GET FRESH LEVELS</button>
+<div class="stamp" id="stamp"></div>
 
 <div class="err" id="err"></div>
 <div id="warns"></div>
-<div class="banner" id="banner"><span id="regime"></span> <span class="badge" id="lowconf"
-     style="display:none">LOW CONFIDENCE</span><div class="sub" id="interp"></div></div>
-<div class="tabs" id="tabs" style="display:none"></div>
+
+<div class="banner" id="banner">
+  <div class="reg"><span id="regime"></span><span class="badge" id="lowconf" style="display:none">LOW CONFIDENCE</span></div>
+  <div class="txt" id="interp"></div>
+</div>
+
 <div class="grid" id="cards" style="display:none">
-  <div class="card"><div class="k">Spot</div><div class="v" id="spot"></div><div class="s" id="asof"></div></div>
-  <div class="card"><div class="k">Gamma flip</div><div class="v" id="flip"></div><div class="s" id="flipeq"></div></div>
-  <div class="card cw"><div class="k">Call wall (pin/resist)</div><div class="v" id="cw"></div><div class="s" id="cwg"></div></div>
-  <div class="card pw"><div class="k">Put wall (support/accel)</div><div class="v" id="pw"></div><div class="s" id="pwg"></div></div>
-  <div class="card"><div class="k">Net GEX / 1%</div><div class="v" id="net"></div><div class="s" id="ncon"></div></div>
-  <div class="card"><div class="k">Gross |Γ| / 1%</div><div class="v" id="gross"></div><div class="s" id="oid"></div></div>
+  <div class="card wide"><div class="k">Spot</div><div class="v" id="spot"></div><div class="s" id="spotsub"></div></div>
+  <div class="card fl"><div class="k">Gamma flip</div><div class="v" id="flip"></div><div class="s" id="flipsub"></div></div>
+  <div class="card"><div class="k">Net GEX / 1%</div><div class="v" id="net"></div><div class="s" id="netsub"></div></div>
+  <div class="card cw"><div class="k">Call wall</div><div class="v" id="cw"></div><div class="s">resistance / pin</div></div>
+  <div class="card pw"><div class="k">Put wall</div><div class="v" id="pw"></div><div class="s">support / accelerant</div></div>
 </div>
-<canvas id="chart" width="10" height="10" style="display:none"></canvas>
-<div id="bwrap" style="display:none">
-  <table id="bt"><thead><tr><th>Expiry bucket (urgency)</th><th>Gross</th><th>Share</th><th>Net</th></tr></thead>
-  <tbody></tbody></table>
-</div>
-<div class="meta" id="meta"></div>
+
+<canvas id="chart"></canvas>
+<table id="bt"><thead><tr><th>Expiry bucket</th><th>Gross</th><th>Share</th><th>Net</th></tr></thead><tbody></tbody></table>
+<div class="foot" id="foot"></div>
 
 <script>
 const $ = id => document.getElementById(id);
-const S = { ticker: localStorage.gexTicker || 'QQQ', expiry: 'both', data: null, viewIdx: 0, timer: null };
-const bn = x => (x==null) ? 'n/a' : (x/1e9).toLocaleString(undefined,{maximumFractionDigits:2,minimumFractionDigits:2})+' $Bn';
-const px = x => (x==null) ? 'n/a' : Number(x).toLocaleString(undefined,{maximumFractionDigits:2,minimumFractionDigits:2});
+const S = { ticker: localStorage.gexTicker || 'SPY', expiry: localStorage.gexExpiry || 'all', data: null };
 
-function syncChips() {
-  document.querySelectorAll('.tk').forEach(c => c.classList.toggle('on', c.dataset.t === S.ticker));
-  if (!['SPY','QQQ'].includes(S.ticker)) $('tick').value = S.ticker;
+const px = x => x == null ? '—' : Number(x).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+const bn = x => x == null ? '—' : (x/1e9).toFixed(2) + ' $Bn';
+
+function setTicker(t){
+  S.ticker = t; localStorage.gexTicker = t;
+  $('bSPY').classList.toggle('on', t === 'SPY');
+  $('bQQQ').classList.toggle('on', t === 'QQQ');
 }
-async function jget(u) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), 100000);   // hard client-side deadline
+
+async function jget(url, ms){
+  const c = new AbortController();
+  const timer = setTimeout(() => c.abort(), ms || 120000);
   let r;
-  try { r = await fetch(u, {signal: ctl.signal}); }
-  catch (e) { clearTimeout(t); throw {message: e.name === 'AbortError' ? 'request timed out' : 'network error'}; }
-  clearTimeout(t);
+  try { r = await fetch(url, {signal:c.signal, cache:'no-store'}); }
+  catch(e){ clearTimeout(timer); throw {message: e.name === 'AbortError' ? 'Timed out. Tap again.' : 'Network error — is the Mac awake and on Wi-Fi?'}; }
+  clearTimeout(timer);
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw (j.error || {message: 'HTTP ' + r.status});
+  if (!r.ok) throw (j.error || {message:'HTTP ' + r.status});
   return j;
 }
-async function loadHealth() {
-  try {
-    const h = await jget('/api/health');
-    $('dot').className = 'dot ' + (h.ok ? 'ok' : 'bad');
-    $('tok').textContent = h.token_days_left != null ? ('token ' + h.token_days_left.toFixed(1) + 'd left') : '';
-  } catch (e) { $('dot').className = 'dot bad'; }
-}
-async function loadExpirations() {
-  try {
-    const j = await jget('/api/expirations?ticker=' + S.ticker);
-    const sel = $('exp'); const cur = S.expiry;
-    sel.innerHTML = '<option value="both">0DTE + All (45d)</option>' +
-                    '<option value="0dte">0DTE only</option><option value="all">All (45d)</option>' +
-      j.expirations.map(d => `<option value="${d}">${d}</option>`).join('');
-    sel.value = [...sel.options].some(o => o.value === cur) ? cur : 'both';
-    S.expiry = sel.value;
-  } catch (e) { /* picker degrades to the 3 basics */ }
-}
-async function load() {
-  $('spin').style.display = 'inline'; $('err').style.display = 'none';
-  try {
-    const j = await jget(`/api/gex?ticker=${S.ticker}&expiry=${S.expiry}`);
-    S.data = j;
-    S.viewIdx = j.views.findIndex(v => !v.empty);
-    if (S.viewIdx < 0) S.viewIdx = 0;
-    if (j.views.length > 1 && !j.views[1].empty) S.viewIdx = 1;   // prefer ALL when populated
-    render();
-  } catch (e) {
-    $('err').textContent = (e.code === 'schwab_token_expired' ? '🔑 ' : '⚠️ ') + (e.message || 'request failed');
-    $('err').style.display = 'block';
-  }
-  $('spin').style.display = 'none';
-}
-function render() {
-  const j = S.data; if (!j) return;
-  // tabs
-  const tabs = $('tabs');
-  if (j.views.length > 1) {
-    tabs.style.display = 'flex';
-    tabs.innerHTML = j.views.map((v, i) =>
-      `<span class="chip ${i===S.viewIdx?'on':''}" onclick="S.viewIdx=${i};render()">${v.label}${v.empty?' (empty)':''}</span>`).join('');
-  } else tabs.style.display = 'none';
 
-  $('warns').innerHTML = (j.warnings||[]).map(w => `<div class="warn">${w}</div>`).join('');
-  const v = j.views[S.viewIdx];
-  if (!v || v.empty) {
+async function health(){
+  try{
+    const h = await jget('/api/health', 8000);
+    $('dot').className = 'dot ' + (h.ok ? 'ok' : 'bad');
+    $('tok').textContent = h.auth_error === 'schwab_token_expired'
+      ? 'token expired' : (h.token_days_left != null ? 'token ' + h.token_days_left.toFixed(1) + 'd' : '');
+  }catch(e){ $('dot').className = 'dot bad'; }
+}
+
+async function loadExpiries(){
+  const sel = $('exp');
+  const base = '<option value="all">All expiries (45d)</option><option value="0dte">0DTE only (today)</option>';
+  try{
+    const j = await jget('/api/expirations?ticker=' + S.ticker, 45000);
+    sel.innerHTML = base + j.expirations.map(d => {
+      const dt = new Date(d + 'T12:00:00');
+      const lbl = dt.toLocaleDateString(undefined,{weekday:'short', month:'short', day:'numeric'});
+      return `<option value="${d}">${lbl}</option>`;
+    }).join('');
+  }catch(e){ sel.innerHTML = base; }
+  sel.value = [...sel.options].some(o => o.value === S.expiry) ? S.expiry : 'all';
+  S.expiry = sel.value;
+}
+
+async function fetchLevels(){
+  const btn = $('go');
+  btn.disabled = true; btn.classList.add('busy');
+  btn.innerHTML = '<span class="spin"></span>FETCHING…';
+  $('err').style.display = 'none';
+  $('stamp').textContent = 'contacting Schwab…';
+  try{
+    // fresh=1 bypasses the server cache so this is always a live pull.
+    const j = await jget(`/api/gex?ticker=${S.ticker}&expiry=${encodeURIComponent(S.expiry)}&fresh=1`, 120000);
+    S.data = j; render(j);
+  }catch(e){
+    $('err').textContent = (e.code === 'schwab_token_expired' ? '🔑 ' : '⚠️ ') + (e.message || 'Request failed');
+    $('err').style.display = 'block';
+    $('stamp').textContent = '';
+  }
+  btn.disabled = false; btn.classList.remove('busy'); btn.textContent = 'GET FRESH LEVELS';
+  health();
+}
+
+function render(j){
+  const v = (j.views || []).find(x => !x.empty) || (j.views || [])[0];
+  $('warns').innerHTML = (j.warnings || []).map(w => `<div class="warn">${w}</div>`).join('');
+  const t = new Date(j.as_of_et);
+  $('stamp').textContent = 'fetched ' + t.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'})
+                         + ' ET · ' + j.runtime_s + 's';
+
+  if (!v || v.empty){
     $('banner').className = 'banner'; $('cards').style.display = 'none';
-    $('chart').style.display = 'none'; $('bwrap').style.display = 'none';
-    $('meta').textContent = 'No usable contracts in this slice.';
+    $('chart').style.display = 'none'; $('bt').style.display = 'none';
+    $('foot').textContent = 'No levels — ' + ((v && v.reason) || 'no contracts with usable OI and IV')
+      + '. Pick another expiry, or use "All expiries".';
     return;
   }
-  const isShort = v.regime.includes('SHORT');
-  $('banner').className = 'banner ' + (isShort ? 'short' : 'long');
-  $('regime').textContent = v.regime + '  (' + j.ticker + ')';
-  $('lowconf').style.display = v.low_confidence ? 'inline' : 'none';
+
+  const short = v.regime.indexOf('SHORT') >= 0;
+  $('banner').className = 'banner on ' + (short ? 'short' : 'long');
+  $('regime').textContent = v.regime + ' · ' + j.ticker;
+  $('lowconf').style.display = v.low_confidence ? 'inline-block' : 'none';
   $('interp').textContent = v.interpretation;
 
   $('cards').style.display = 'grid';
   $('spot').textContent = px(j.spot);
-  $('asof').textContent = new Date(j.as_of_et).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + (j.cached ? ' · cached' : ' · live');
+  $('spotsub').textContent = v.label + ' · OI from ' + j.oi_date + ' close';
   $('flip').textContent = px(v.flip);
-  $('flipeq').textContent = v.flip_equiv ? (v.flip_equiv.ticker + ' ' + px(v.flip_equiv.level)) : (v.crossings.length > 1 ? v.crossings.length + ' crossings' : '');
-  $('cw').textContent = px(v.call_wall); $('cwg').textContent = bn(v.call_wall_gex);
-  $('pw').textContent = px(v.put_wall); $('pwg').textContent = bn(v.put_wall_gex);
-  $('net').textContent = bn(v.total); $('ncon').textContent = j.convention.split('(')[0].trim();
-  $('gross').textContent = bn(v.gross); $('oid').textContent = 'OI ' + j.oi_date;
+  $('flipsub').textContent = v.flip == null ? 'none in ±10%'
+      : (v.flip_equiv ? v.flip_equiv.ticker + ' ' + px(v.flip_equiv.level)
+                      : (j.spot > v.flip ? 'spot above → long gamma' : 'spot below → short gamma'));
+  $('net').textContent = bn(v.total);
+  $('netsub').textContent = (v.total < 0 ? 'dealers short gamma' : 'dealers long gamma');
+  $('cw').textContent = px(v.call_wall);
+  $('pw').textContent = px(v.put_wall);
 
   drawChart(v, j.spot);
-  // buckets
-  const bw = $('bwrap');
-  if (j.buckets && j.buckets.length) {
-    bw.style.display = 'block';
-    $('bt').querySelector('tbody').innerHTML = j.buckets.map(b =>
-      `<tr><td>${b.label}</td><td>${bn(b.gross)}</td><td>${(b.share*100).toFixed(1)}%</td><td>${bn(b.net)}</td></tr>`).join('');
-  } else bw.style.display = 'none';
-  $('meta').innerHTML = `OI as of <b>${j.oi_date}</b> (prior session — 0DTE opened today is NOT in it) · ` +
-    `r=${j.rate} q=${j.div_yield} (${j.div_src}) · ${v.n} contracts · ${j.runtime_s}s` +
-    ` · dropped: OI=${j.dropped.no_oi} IV=${j.dropped.no_iv} ITM-quote=${j.dropped.itm_bad_quote||0}` +
-    `<br>Dealer-sign convention is an assumption; levels are a regime guide, not entry triggers.`;
+
+  const tb = $('bt');
+  if (j.buckets && j.buckets.length){
+    tb.style.display = 'table';
+    tb.querySelector('tbody').innerHTML = j.buckets.map(b =>
+      `<tr><td>${b.label}</td><td>${bn(b.gross)}</td><td>${(b.share*100).toFixed(0)}%</td><td>${bn(b.net)}</td></tr>`).join('');
+  } else tb.style.display = 'none';
+
+  $('foot').innerHTML =
+    `<b>Spot and IV are live; open interest is from the ${j.oi_date} close</b> — positions opened today ` +
+    `(especially 0DTE) are not in it.<br>r=${j.rate} · q=${j.div_yield} (${j.div_src}) · ${v.n} contracts · ` +
+    `dealer-sign convention is an assumption. Regime context, not an entry trigger.`;
 }
-function drawChart(v, spot) {
-  const c = $('chart'); c.style.display = 'block';
+
+function drawChart(v, spot){
+  const c = $('chart');
+  const ks = (v.profile && v.profile.strikes) || [], ns = (v.profile && v.profile.net) || [];
+  if (!ks.length){ c.style.display = 'none'; return; }
+  c.style.display = 'block';
   const dpr = window.devicePixelRatio || 1;
-  // clientWidth is 0 while the page/pane is hidden -> zero-width bitmap (blank
-  // chart). Fall back to the parent, then a sane default; a redraw also fires
-  // on resize/visibilitychange below.
-  const cssW = c.clientWidth || (c.parentElement && c.parentElement.clientWidth) || 351;
-  const W = cssW * dpr, H = 230 * dpr;
+  const cssW = c.clientWidth || (c.parentElement && c.parentElement.clientWidth) || 340;
+  const W = cssW * dpr, H = 210 * dpr;
   c.width = W; c.height = H;
   const g = c.getContext('2d');
-  const ks = v.profile.strikes, ns = v.profile.net;
-  if (!ks.length) return;
-  const pad = 8 * dpr, padB = 22 * dpr;
+  const pad = 8*dpr, padB = 20*dpr;
   const x0 = Math.min(...ks), x1 = Math.max(...ks);
   const ymax = Math.max(1, ...ns.map(Math.abs));
-  const X = k => pad + (k - x0) / (x1 - x0 || 1) * (W - 2*pad);
-  const Y = n => (H - padB)/2 - (n / ymax) * ((H - padB)/2 - pad);
-  // x gridlines on multiples of 10 (coarsen if dense)
-  let step = 10; while ((x1 - x0) / step > 16) step *= (step % 3 === 0 ? 2 : 2.5);
+  const X = k => pad + (k - x0)/(x1 - x0 || 1)*(W - 2*pad);
+  const Y = n => (H - padB)/2 - (n/ymax)*((H - padB)/2 - pad);
+
+  let step = 10; while ((x1 - x0)/step > 14) step *= (step % 3 === 0 ? 2 : 2.5);
   g.strokeStyle = '#21262d'; g.fillStyle = '#8b949e';
-  g.font = (10*dpr) + 'px -apple-system'; g.textAlign = 'center';
-  for (let k = Math.ceil(x0/step)*step; k <= x1; k += step) {
+  g.font = (9.5*dpr) + 'px -apple-system'; g.textAlign = 'center';
+  for (let k = Math.ceil(x0/step)*step; k <= x1; k += step){
     g.beginPath(); g.moveTo(X(k), pad); g.lineTo(X(k), H - padB); g.stroke();
-    g.fillText(k, X(k), H - padB + 14*dpr);
+    g.fillText(k, X(k), H - padB + 13*dpr);
   }
-  // zero line
-  g.strokeStyle = '#30363d'; g.beginPath();
-  g.moveTo(pad, Y(0)); g.lineTo(W - pad, Y(0)); g.stroke();
-  // bars
-  const bw = Math.max(1, (W - 2*pad) / ks.length * 0.7);
-  ks.forEach((k, i) => {
+  g.strokeStyle = '#30363d'; g.beginPath(); g.moveTo(pad, Y(0)); g.lineTo(W - pad, Y(0)); g.stroke();
+
+  const bw = Math.max(1, (W - 2*pad)/ks.length*0.72);
+  ks.forEach((k,i) => {
     g.fillStyle = ns[i] >= 0 ? '#3fb950' : '#f85149';
     const y = Y(ns[i]);
     g.fillRect(X(k) - bw/2, Math.min(y, Y(0)), bw, Math.abs(y - Y(0)) || 1);
   });
-  const vline = (x, color, dash) => { if (x==null || x < x0 || x > x1) return;
-    g.strokeStyle = color; g.setLineDash(dash); g.lineWidth = 1.5*dpr;
+  const line = (x, col, dash) => { if (x == null || x < x0 || x > x1) return;
+    g.strokeStyle = col; g.setLineDash(dash); g.lineWidth = 1.6*dpr;
     g.beginPath(); g.moveTo(X(x), pad); g.lineTo(X(x), H - padB); g.stroke();
     g.setLineDash([]); g.lineWidth = 1; };
-  vline(spot, '#e6edf3', []);
-  vline(v.flip, '#58a6ff', [6*dpr, 4*dpr]);
-  vline(v.call_wall, '#3fb950', [2*dpr, 3*dpr]);
-  vline(v.put_wall, '#f85149', [2*dpr, 3*dpr]);
+  line(spot, '#e6edf3', []);
+  line(v.flip, '#58a6ff', [6*dpr,4*dpr]);
+  line(v.call_wall, '#3fb950', [2*dpr,3*dpr]);
+  line(v.put_wall, '#f85149', [2*dpr,3*dpr]);
 }
-// wiring
-document.querySelectorAll('.tk').forEach(c => c.onclick = () => {
-  S.ticker = c.dataset.t; $('tick').value = ''; localStorage.gexTicker = S.ticker;
-  syncChips(); loadExpirations().then(load);
-});
-$('tick').onchange = () => { const t = $('tick').value.toUpperCase().trim();
-  if (t) { S.ticker = t; localStorage.gexTicker = t; syncChips(); loadExpirations().then(load); } };
-$('exp').onchange = () => { S.expiry = $('exp').value; load(); };
-$('go').onclick = load;
-$('auto').onclick = () => {
-  if (S.timer) { clearInterval(S.timer); S.timer = null; $('auto').classList.remove('on'); }
-  else { S.timer = setInterval(load, 60000); $('auto').classList.add('on'); load(); }
-};
-window.addEventListener('resize', () => S.data && render());
-document.addEventListener('visibilitychange', () => { if (!document.hidden && S.data) render(); });
-syncChips(); loadHealth(); loadExpirations().then(load);
-setInterval(loadHealth, 300000);
+
+// ---- wiring ----
+$('bSPY').onclick = () => { setTicker('SPY'); loadExpiries(); };
+$('bQQQ').onclick = () => { setTicker('QQQ'); loadExpiries(); };
+$('exp').onchange = e => { S.expiry = e.target.value; localStorage.gexExpiry = S.expiry; };
+$('go').onclick = fetchLevels;
+window.addEventListener('resize', () => S.data && drawChart(
+  (S.data.views || []).find(x => !x.empty) || {}, S.data.spot));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) health(); });
+
+setTicker(S.ticker);
+health();
+loadExpiries();
 </script>
 </body>
 </html>

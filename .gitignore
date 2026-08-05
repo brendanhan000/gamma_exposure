@@ -11,3 +11,7 @@ logs/
 .schwab_token.json
 *token*.json
 .env
+
+# Token lock sidecar (multi-process refresh guard)
+*.schwab_token.json.lock
+.schwab_token.json.lock

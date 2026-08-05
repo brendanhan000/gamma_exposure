@@ -95,8 +95,18 @@ def _fetch_bounded(client, symbol, **kw):
 
 
 def _get_client():
+    """Return a Schwab client built from the CURRENT token file.
+
+    Critical: this server is long-lived, so a cached client can outlive the token
+    it was built from (a re-login rewrites the file). Presenting a superseded
+    refresh token makes Schwab revoke the whole family -- observed live: a server
+    started Jul 23 killed an Aug 2 login within a day. So we rebuild whenever the
+    token file changes on disk instead of caching forever.
+    """
     global _client
     with _lock:
+        if _client is not None and gex.schwab_client_stale(_client):
+            _client = None          # token file was rewritten -> discard
         if _client is None:
             _client = gex.get_schwab_client(
                 os.environ.get("SCHWAB_APP_KEY"), os.environ.get("SCHWAB_APP_SECRET"),
@@ -110,28 +120,15 @@ def _drop_client():
         _client = None
 
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
+# Last observed auth state. File age alone is a LIE when the token family has
+# been revoked (age says "6 days left" while every call 401s), so health reports
+# the last real API outcome instead of just the timestamp.
+_auth_error = None
 
-_pool = ThreadPoolExecutor(max_workers=4)
-FETCH_DEADLINE_S = float(os.environ.get("GEX_FETCH_DEADLINE", "90"))
 
-
-def _fetch_bounded(client, symbol, **kw):
-    """gex.fetch_chain_schwab with a hard WALL-CLOCK deadline.
-
-    httpx's read-timeout (30s) only fires on a silent socket; a glacial-but-alive
-    stream that trickles a byte every few seconds can drag one response out for
-    many minutes (observed: 868s). Running the fetch in a worker and abandoning
-    it at the deadline bounds request latency; the dropped client is rebuilt on
-    the next request.
-    """
-    fut = _pool.submit(gex.fetch_chain_schwab, client, symbol, **kw)
-    try:
-        return fut.result(timeout=FETCH_DEADLINE_S)
-    except _FutTimeout:
-        fut.cancel()
-        raise TimeoutError(
-            "Schwab chain fetch exceeded the {:.0f}s deadline".format(FETCH_DEADLINE_S))
+def _note_auth(ok, code=None):
+    global _auth_error
+    _auth_error = None if ok else code
 
 
 def _classify(exc):
@@ -165,7 +162,11 @@ def _token_health():
 @app.get("/api/health")
 def health():
     h = _token_health()
-    h["ok"] = bool(h["token_present"] and (h["token_days_left"] or 0) > 0)
+    h["auth_error"] = _auth_error
+    h["ok"] = bool(h["token_present"] and (h["token_days_left"] or 0) > 0
+                   and _auth_error is None)
+    h["message"] = ("Schwab token rejected -- run scripts/schwab_setup.py"
+                    if _auth_error == "schwab_token_expired" else None)
     h["now_et"] = gex.now_et().isoformat()
     return h
 
@@ -186,6 +187,7 @@ def expirations(ticker: str = Query("SPY", max_length=8)):
     except Exception as e:
         _drop_client()
         status, code, msg = _classify(e)
+        _note_auth(code != "schwab_token_expired", code)
         raise HTTPException(status_code=status, detail={"code": code, "message": msg})
     # Drop expirations that have already settled (16:00 ET) -- selecting one
     # yields an empty chain (the exact "no data at 23:48" footgun).
@@ -199,14 +201,16 @@ def expirations(ticker: str = Query("SPY", max_length=8)):
                     dates.add(d)
             except ValueError:
                 pass
+    _note_auth(True)
     out = sorted(dates)
     _exp_cache[t] = (now, out)
     return {"ticker": t, "expirations": out, "cached": False}
 
 
-def _view_json(label, view, spot, spy_ratio, cfg):
+def _view_json(label, view, spot, spy_ratio, cfg, today=None):
     if view.get("empty"):
-        return {"label": label, "empty": True, "n": 0}
+        reason = gex.explain_empty_view(label, today or gex.now_et().date())
+        return {"label": label, "empty": True, "n": 0, "reason": reason}
     flip = view["flip_std"]["flip"]
     walls = view["walls"]
     band_vals = [x for x in view.get("flip_band", {}).values() if x is not None]
@@ -250,7 +254,8 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
             expiry: str = Query("both"),
             all_days: int = Query(45, ge=1, le=180),
             rate: float = Query(None),
-            div_yield: float = Query(None)):
+            div_yield: float = Query(None),
+            fresh: int = Query(0, ge=0, le=1)):
     t0 = time.time()
     t = ticker.upper().strip()
     exp = expiry.lower().strip()
@@ -264,11 +269,14 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
                 "code": "bad_expiry",
                 "message": "expiry must be 'both', '0dte', 'all', or YYYY-MM-DD"})
 
+    # fresh=1 bypasses the cache entirely: the phone's "GET FRESH LEVELS" button
+    # must re-pull spot/IV from Schwab, never replay a 60s-old snapshot.
     key = (t, exp, all_days, rate, div_yield)
     hit = _gex_cache.get(key)
-    if hit and time.time() - hit[0] < CACHE_TTL_S:
+    if not fresh and hit and time.time() - hit[0] < CACHE_TTL_S:
         payload = dict(hit[1])
         payload["cached"] = True
+        payload["cache_age_s"] = round(time.time() - hit[0], 1)
         return payload
 
     # Config mirrors gex.main(): explicit args win, else per-ticker q map.
@@ -298,8 +306,10 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
     except Exception as e:
         _drop_client()
         status, code, msg = _classify(e)
+        _note_auth(code != "schwab_token_expired", code)
         raise HTTPException(status_code=status, detail={"code": code, "message": msg})
 
+    _note_auth(True)
     contracts, spot, ts_ns, dropped, status = gex.parse_schwab_chain(data)
     if spot is None:
         raise HTTPException(status_code=502, detail={
@@ -333,7 +343,7 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
 
     views = []
     for lbl, cs in views_raw:
-        views.append(_view_json(lbl, gex.compute_view(cs, spot, cfg), spot, spy_ratio, cfg))
+        views.append(_view_json(lbl, gex.compute_view(cs, spot, cfg), spot, spy_ratio, cfg, today))
 
     buckets = gex.gamma_expiry_buckets(usable, spot, cfg, today) if usable else []
 
