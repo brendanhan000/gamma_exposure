@@ -148,6 +148,54 @@ def test_flip_invariant_to_multiplier_and_oi_scaling():
     assert r1 == pytest.approx(r2, abs=1e-6)
 
 
+def _0dte_cfg(steps=1000):
+    # 0DTE-style config: tiny T makes gamma a near-step at the strike, which is
+    # exactly the regime that exposed the phantom-crossing and grid-node bugs.
+    return Config(rate=0.0, div_yield=0.0, multiplier=100, price_range=0.10,
+                  steps=steps, convention=CONV_STANDARD, flipped_convention=CONV_FLIPPED)
+
+
+def _0dte_contracts():
+    T0 = 4 * 3600.0 / (365 * 24 * 3600)   # ~4 hours in years
+    return [
+        Contract(99.0, date(2026, 8, 5), "put", 5000.0, 0.10, T=T0),
+        Contract(101.0, date(2026, 8, 5), "call", 5000.0, 0.10, T=T0),
+    ]
+
+
+def test_flip_no_phantom_crossings_from_underflow():
+    # Regression for the wing-underflow bug: far from the strikes, 0DTE gamma
+    # underflows to a literal 0.0, and the old detector appended EVERY exact-zero
+    # grid node as a "crossing" (77 reported, 76 of them float noise). Only the
+    # single genuine crossing near the strikes may be reported.
+    res = find_flip_level(_0dte_contracts(), 100.0, CONV_STANDARD, _0dte_cfg())
+    assert res["flip"] is not None
+    assert len(res["crossings"]) == 1
+    # The one crossing must sit between the two strikes, not out in the wings.
+    assert 99.0 < res["crossings"][0] < 101.0
+
+
+def test_flip_total_at_spot_is_exact_not_nearest_grid():
+    # Regression: total_at_spot must be evaluated AT spot, not read off the
+    # nearest grid node. On a steep 0DTE curve the nearest node can carry the
+    # OPPOSITE sign, which used to mislabel the regime in the no-flip branch.
+    contracts = _0dte_contracts()
+    res = find_flip_level(contracts, 100.0, CONV_STANDARD, _0dte_cfg())
+    exact = compute_gex_profile(contracts, 100.0, CONV_STANDARD, _0dte_cfg())["total"]
+    assert res["total_at_spot"] == pytest.approx(exact, rel=1e-12)
+    assert np.sign(res["total_at_spot"]) == np.sign(exact)
+
+
+def test_flip_root_refined_to_machine_precision():
+    # Regression: the bracketed crossing is refined with Brent's method, so the
+    # 1000-step flip matches a 200k-step (near-exact) search to ~1e-9 instead of
+    # being limited by linear interpolation across a wide grid cell.
+    contracts = _0dte_contracts()
+    coarse = find_flip_level(contracts, 100.0, CONV_STANDARD, _0dte_cfg(steps=1000))["flip"]
+    fine = find_flip_level(contracts, 100.0, CONV_STANDARD, _0dte_cfg(steps=200000))["flip"]
+    assert coarse == pytest.approx(fine, abs=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Profile / walls
 # ---------------------------------------------------------------------------
@@ -276,6 +324,28 @@ def test_quote_filters_crossed_and_deep_itm():
     assert dropped["crossed"] == 1
     kept = {(c.cp, c.strike) for c in contracts}
     assert kept == {("call", 98.0), ("put", 80.0)}   # wing gamma preserved
+
+
+def test_quote_filter_crossed_to_zero_ask():
+    # Regression: a crossed quote with ask == 0 (bid > ask == 0, common pre-open)
+    # used to slip through because the crossed check required ask > 0. bid > ask
+    # is crossed regardless of the ask level and must be dropped.
+    data = {
+        "status": "SUCCESS",
+        "underlyingPrice": 100.0,
+        "callExpDateMap": {
+            "2027-01-15:180": {
+                "100.0": [{"putCall": "CALL", "strikePrice": 100.0, "openInterest": 100,
+                           "volatility": 20.0, "bid": 1.5, "ask": 0.0}],   # crossed-to-zero -> drop
+                "101.0": [{"putCall": "CALL", "strikePrice": 101.0, "openInterest": 100,
+                           "volatility": 20.0, "bid": 1.0, "ask": 1.2}],   # clean -> keep
+            }
+        },
+        "putExpDateMap": {},
+    }
+    contracts, spot, ts_ns, dropped, status = parse_schwab_chain(data)
+    assert dropped["crossed"] == 1
+    assert {(c.cp, c.strike) for c in contracts} == {("call", 101.0)}
 
 
 def test_div_yield_per_ticker_map():

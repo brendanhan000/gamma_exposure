@@ -333,14 +333,60 @@ def gross_dollar_gamma(contracts, spot, cfg):
 # ===========================================================================
 # Gamma flip / zero-gamma level
 # ===========================================================================
+def _total_net_gex_at(S, K, T, iv, oi, sign, cfg):
+    """Total signed net dollar-GEX at a single hypothetical spot S.
+
+    This is the objective the flip search zeroes. Kept as a standalone so the
+    root-finder can reprice at arbitrary S (not just grid nodes) and so
+    'total_at_spot' is evaluated EXACTLY at the current spot rather than read off
+    the nearest grid node (which need not contain spot and can even carry the
+    opposite sign on a steep 0DTE curve).
+    """
+    gamma = compute_gamma_bsm(S, K, T, iv, cfg.rate, cfg.div_yield)
+    return float(np.sum(sign * gamma * oi * cfg.multiplier * (S ** 2) * 0.01))
+
+
+def _refine_root(f, x0, x1):
+    """Refine a bracketed root of f to machine precision.
+
+    Uses Brent's method (scipy.optimize.brentq) when available; falls back to
+    bisection otherwise. Both x0 and x1 must bracket a sign change (f(x0) and
+    f(x1) opposite signs, neither zero). Returns the root as a float.
+    """
+    try:
+        from scipy.optimize import brentq
+        return float(brentq(f, x0, x1, xtol=1e-10, rtol=1e-12, maxiter=100))
+    except Exception:
+        # Bisection fallback: robust, no scipy dependency.
+        a, b = float(x0), float(x1)
+        fa, fb = f(a), f(b)
+        for _ in range(200):
+            m = 0.5 * (a + b)
+            fm = f(m)
+            if fm == 0.0 or (b - a) < 1e-10:
+                return m
+            if fa * fm < 0.0:
+                b, fb = m, fm
+            else:
+                a, fa = m, fm
+        return 0.5 * (a + b)
+
+
 def find_flip_level(contracts, spot, convention, cfg, price_range=None, steps=None):
     """Find the zero-gamma (flip) spot by repricing TOTAL net GEX on a grid.
 
     For each hypothetical spot S' in [spot*(1-range), spot*(1+range)] we recompute
     gamma for every contract and sum the signed dollar-GEX, then locate sign
-    changes and linearly interpolate the crossings. Returns the crossing nearest
-    the current spot as 'flip' (None if there is no crossing in range), plus all
-    'crossings' and the ('grid','curve') for plotting/debugging.
+    changes. Each bracketed crossing is refined to machine precision with Brent's
+    method (the net-GEX curve is smooth but can be near-discontinuous for 0DTE,
+    where linear interpolation across a wide grid cell is a poor model). Returns
+    the crossing nearest the current spot as 'flip' (None if there is no crossing
+    in range), plus all 'crossings' and the ('grid','curve') for plotting/debugging.
+
+    Exact-zero grid nodes are NOT treated as crossings on their own: far from the
+    strikes, 0DTE gamma underflows to a literal 0.0, which would otherwise report
+    dozens of phantom "crossings" in the flat wings. A node is only a crossing if
+    it is a genuine sign change relative to its nearest non-zero neighbours.
     """
     price_range = cfg.price_range if price_range is None else price_range
     steps = cfg.steps if steps is None else steps
@@ -349,22 +395,47 @@ def find_flip_level(contracts, spot, convention, cfg, price_range=None, steps=No
     grid = np.linspace(spot * (1.0 - price_range), spot * (1.0 + price_range), steps)
     curve = np.empty_like(grid)
     for i, S in enumerate(grid):
-        gamma = compute_gamma_bsm(S, K, T, iv, cfg.rate, cfg.div_yield)
-        curve[i] = np.sum(sign * gamma * oi * cfg.multiplier * (S ** 2) * 0.01)
+        curve[i] = _total_net_gex_at(S, K, T, iv, oi, sign, cfg)
 
-    # Locate zero crossings: exact grid zeros and sign changes (interpolated).
+    def f(S):
+        return _total_net_gex_at(S, K, T, iv, oi, sign, cfg)
+
+    # Locate zero crossings. A real crossing is a sign change between adjacent
+    # nodes. Exact-zero nodes (float underflow in the wings) are ignored unless
+    # they sit between two non-zero nodes of opposite sign (a genuine touch).
     crossings = []
-    s = np.sign(curve)
-    for i in range(len(grid) - 1):
-        if s[i] == 0.0:
-            crossings.append(float(grid[i]))
-        elif s[i] * s[i + 1] < 0.0:
-            x0, x1, y0, y1 = grid[i], grid[i + 1], curve[i], curve[i + 1]
-            crossings.append(float(x0 - y0 * (x1 - x0) / (y1 - y0)))
-    if s[-1] == 0.0:
-        crossings.append(float(grid[-1]))
+    n = len(grid)
+    for i in range(n - 1):
+        y0, y1 = curve[i], curve[i + 1]
+        if y0 == 0.0 and y1 == 0.0:
+            continue                      # flat underflowed wing: not a crossing
+        if y0 == 0.0 or y1 == 0.0:
+            # One node exactly zero: a crossing only if the surrounding non-zero
+            # values straddle zero. Find nearest non-zero on each side.
+            left = y0
+            if left == 0.0:
+                j = i - 1
+                while j >= 0 and curve[j] == 0.0:
+                    j -= 1
+                left = curve[j] if j >= 0 else 0.0
+            right = y1
+            if right == 0.0:
+                j = i + 2
+                while j < n and curve[j] == 0.0:
+                    j += 1
+                right = curve[j] if j < n else 0.0
+            if left != 0.0 and right != 0.0 and left * right < 0.0:
+                # Genuine sign change across a zero node; refine on the wider
+                # bracket that contains the change.
+                lo = grid[i] if y0 != 0.0 else grid[i]
+                hi = grid[i + 1] if y1 != 0.0 else grid[i + 1]
+                crossings.append(_refine_root(f, lo, hi) if (f(lo) * f(hi) < 0.0)
+                                 else float(0.5 * (lo + hi)))
+            continue
+        if y0 * y1 < 0.0:
+            crossings.append(_refine_root(f, grid[i], grid[i + 1]))
 
-    crossings = np.array(crossings, dtype=float)
+    crossings = np.array(sorted(set(crossings)), dtype=float)
     nearest = None
     if crossings.size:
         nearest = float(crossings[np.argmin(np.abs(crossings - spot))])
@@ -374,7 +445,9 @@ def find_flip_level(contracts, spot, convention, cfg, price_range=None, steps=No
         "crossings": crossings,
         "grid": grid,
         "curve": curve,
-        "total_at_spot": float(curve[np.argmin(np.abs(grid - spot))]),
+        # Evaluated EXACTLY at spot (not the nearest grid node) so it always
+        # agrees in sign and magnitude with the per-strike profile total.
+        "total_at_spot": f(spot),
     }
 
 
@@ -700,7 +773,11 @@ def parse_schwab_chain(data):
                         askf = float(o["ask"]) if o.get("ask") is not None else None
                     except (TypeError, ValueError):
                         askf = None
-                    if bidf is not None and askf is not None and askf > 0 and bidf > askf:
+                    # Crossed market (bid > ask) is stale/locked data anywhere.
+                    # The ask>0 guard previously let a crossed-to-ZERO quote
+                    # (bid > ask == 0, common pre-open) slip through; bid > ask
+                    # is crossed regardless of whether ask is positive.
+                    if bidf is not None and askf is not None and bidf > askf:
                         dropped["crossed"] += 1          # crossed market: stale data
                         continue
                     if spot and (bidf is not None or askf is not None):
