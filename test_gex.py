@@ -12,7 +12,7 @@ No network is touched.
 """
 import math
 import os
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -24,7 +24,10 @@ from gex import (
     CONV_FLIPPED,
     compute_gamma_bsm,
     find_flip_level,
+    flip_time_decay,
+    _decayed_contracts,
     compute_gex_profile,
+    compute_view,
     find_walls,
     parse_schwab_chain,
     to_schwab_symbol,
@@ -197,6 +200,87 @@ def test_flip_root_refined_to_machine_precision():
 
 
 # ---------------------------------------------------------------------------
+# Flip time-decay projection (fix #2): the flip migrates as T decays
+# ---------------------------------------------------------------------------
+def test_decayed_contracts_advance_T_and_drop_expired():
+    # Advancing time must shrink every survivor's T and drop contracts that
+    # expire inside the interval. T is stored in years (ACT/365).
+    T0 = 8 * 3600.0 / (365 * 24 * 3600)     # 8 hours in years
+    cs = [Contract(100.0, date(2026, 8, 5), "call", 100.0, 0.2, T=T0)]
+    out = _decayed_contracts(cs, 2 * 3600.0)   # advance 2 hours
+    assert len(out) == 1
+    assert out[0].T == pytest.approx(T0 - 2 * 3600.0 / (365 * 24 * 3600), rel=1e-9)
+    # Advancing past expiry drops the contract entirely.
+    assert _decayed_contracts(cs, 9 * 3600.0) == []
+
+
+def test_decayed_contracts_floor_tiny_T():
+    # Survivors are floored at the same T_FLOOR as the live snapshot so the
+    # projection is numerically consistent (ATM gamma does not blow up).
+    import gex
+    T0 = 10 * 60.0 / (365 * 24 * 3600)      # 10 minutes in years
+    cs = [Contract(100.0, date(2026, 8, 5), "call", 100.0, 0.2, T=T0)]
+    out = _decayed_contracts(cs, 9 * 60.0)     # 9 minutes decay -> 1 minute left
+    floor_T = gex.T_FLOOR_SECONDS / (365 * 24 * 3600)
+    assert out[0].T == pytest.approx(floor_T, rel=1e-9)
+
+
+def test_flip_time_decay_reports_now_and_close():
+    # The projection must return BOTH the current flip and the close-of-day flip,
+    # and the signed move between them. _0dte_contracts() carry T = 4 hours, so
+    # use a `now` within 4 hours of the 16:00 ET close (13:00 ET -> 3h left) to
+    # leave survivors after the decay.
+    import gex
+    et = gex._et_tz()
+    now = datetime(2026, 8, 5, 13, 0, tzinfo=et)     # Wednesday 13:00 ET, 3h to close
+    contracts = _0dte_contracts()
+    res = flip_time_decay(contracts, 100.0, _0dte_cfg(), now)
+    assert 0 < res["seconds"] < 4 * 3600             # less time left than the contracts' T
+    assert res["flip_now"] is not None
+    assert res["flip_close"] is not None
+    assert res["move"] == pytest.approx(res["flip_close"] - res["flip_now"], rel=1e-9)
+
+
+def test_flip_time_decay_none_after_close():
+    # After 16:00 ET the 0DTE has settled: no projection, seconds <= 0.
+    import gex
+    et = gex._et_tz()
+    now = datetime(2026, 8, 5, 17, 30, tzinfo=et)    # Wednesday 17:30 ET
+    contracts = _0dte_contracts()
+    res = flip_time_decay(contracts, 100.0, _0dte_cfg(), now)
+    assert res["seconds"] <= 0
+    assert res["flip_close"] is None
+    assert res["move"] is None
+
+
+def test_flip_time_decay_moves_toward_atm_for_0dte():
+    # As T -> 0, gamma concentrates at the strikes and the flip is pulled toward
+    # the dominant strike. The close-of-day flip must differ from the current
+    # flip (the whole point of the projection is that the level is NOT static).
+    # _0dte_contracts() carry T = 4h, so use 13:30 ET (2.5h to close) to leave
+    # survivors after the decay.
+    import gex
+    et = gex._et_tz()
+    now = datetime(2026, 8, 5, 13, 30, tzinfo=et)    # 2.5h to the close
+    contracts = _0dte_contracts()
+    res = flip_time_decay(contracts, 100.0, _0dte_cfg(), now)
+    assert res["flip_now"] is not None and res["flip_close"] is not None
+    assert res["flip_now"] != pytest.approx(res["flip_close"], abs=1e-9)
+
+
+def test_compute_view_includes_flip_decay():
+    # compute_view must surface the time-decay projection so renderers can show it.
+    import gex
+    et = gex._et_tz()
+    now = datetime(2026, 8, 5, 10, 0, tzinfo=et)
+    view = compute_view(_0dte_contracts(), 100.0, _0dte_cfg(), now=now)
+    assert not view["empty"]
+    assert "flip_decay" in view
+    assert view["flip_decay"]["flip_now"] is not None
+    assert view["flip_decay"]["seconds"] > 0
+
+
+# ---------------------------------------------------------------------------
 # Profile / walls
 # ---------------------------------------------------------------------------
 def test_walls_pick_extreme_net_strikes():
@@ -209,8 +293,32 @@ def test_walls_pick_extreme_net_strikes():
     ]
     profile = compute_gex_profile(contracts, 100.0, CONV_STANDARD, cfg)
     walls = find_walls(profile)
-    assert walls["call_wall"] == 110.0      # most positive net GEX
-    assert walls["put_wall"] == 90.0        # most negative net GEX
+    assert walls["call_wall"] == 110.0      # largest call-side gamma
+    assert walls["put_wall"] == 90.0        # largest put-side gamma
+    assert walls["call_wall_gex"] > 0
+    assert walls["put_wall_gex"] < 0
+
+
+def test_walls_are_per_side_not_net():
+    # Regression for the net-GEX wall bug: a strike with huge call AND put gamma
+    # nets to ~zero but must still be found as a wall. Build a balanced strike at
+    # 100 (big call + big put, net ~ 0) and a smaller one-sided call at 110.
+    # Net-based walls would pick 110 (the only non-zero net); per-side walls must
+    # pick 100 for BOTH sides because that is where the gross gamma actually sits.
+    cfg = _cfg()
+    contracts = [
+        Contract(100.0, date(2027, 1, 1), "call", 9000.0, 0.2, T=1.0),   # big call
+        Contract(100.0, date(2027, 1, 1), "put",  9000.0, 0.2, T=1.0),   # big put -> net ~0
+        Contract(110.0, date(2027, 1, 1), "call", 2000.0, 0.2, T=1.0),   # smaller net winner
+    ]
+    profile = compute_gex_profile(contracts, 100.0, CONV_STANDARD, cfg)
+    # Confirm the balanced strike really does net to ~zero (the bug's premise).
+    i100 = int(np.where(profile["strikes"] == 100.0)[0][0])
+    assert abs(profile["net"][i100]) < 1e-6 * abs(profile["call_gex"][i100])
+    walls = find_walls(profile)
+    assert walls["call_wall"] == 100.0      # biggest CALL gamma, despite ~zero net
+    assert walls["put_wall"] == 100.0       # biggest PUT gamma, despite ~zero net
+    # The per-side magnitudes at the wall exceed the one-sided 110 strike.
     assert walls["call_wall_gex"] > 0
     assert walls["put_wall_gex"] < 0
 
@@ -416,6 +524,38 @@ def test_explain_empty_view_distinguishes_expired_from_missing():
     assert "settled" in gex.explain_empty_view("EXPIRY 2026-08-04", wed, now=after_close)
 
 
+def test_is_0dte_label_detection():
+    # Fix #3: the 0DTE staleness escalation fires only for 0DTE views. The label
+    # helper must recognize the 0DTE tag regardless of case and reject others.
+    import gex
+    assert gex._is_0dte_label("0DTE")
+    assert gex._is_0dte_label("0dte")
+    assert not gex._is_0dte_label("ALL EXPIRIES")
+    assert not gex._is_0dte_label("EXPIRY 2026-08-21")
+
+
+def test_render_summary_escalates_0dte_staleness(capsys):
+    # Fix #3: a 0DTE view WITH a flip must carry the prominent staleness caveat
+    # next to the headline number; a non-0DTE view must NOT.
+    import gex
+    et = gex._et_tz()
+    now = datetime(2026, 8, 5, 10, 0, tzinfo=et)     # mid-session Wednesday
+    today = now.date()
+    cfg = _0dte_cfg()
+    cfg.ticker = "SPY"
+    view = compute_view(_0dte_contracts(), 100.0, cfg, now=now)
+    assert view["flip_std"]["flip"] is not None
+
+    gex.render_summary("0DTE", view, 100.0, 10.0, cfg, today)
+    out = capsys.readouterr().out
+    assert "0DTE CAVEAT" in out
+    assert "LAST NIGHT's OI" in out
+
+    gex.render_summary("ALL EXPIRIES", view, 100.0, 10.0, cfg, today)
+    out_all = capsys.readouterr().out
+    assert "0DTE CAVEAT" not in out_all
+
+
 def test_monthly_opex_calendar():
     assert third_friday(2026, 7) == date(2026, 7, 17)
     assert third_friday(2026, 8) == date(2026, 8, 21)
@@ -574,3 +714,143 @@ def test_schwab_setup_script_importable():
     assert callable(mod.main)
     assert isinstance(mod.CALLBACK, str) and mod.CALLBACK
     assert mod.TOKEN_PATH  # default token path is defined
+
+
+# ---------------------------------------------------------------------------
+# scripts/oi_history.py -- dOI opening-ratio grading + CBOE open-close ingestion
+# ---------------------------------------------------------------------------
+def _load_oi_history():
+    """Import scripts/oi_history.py as a module (it lives outside the package)."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(__file__), "scripts", "oi_history.py")
+    spec = importlib.util.spec_from_file_location("oi_history", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_open_close_column_matching_flexible_spellings():
+    # The CSV column matcher must accept common vendor spellings (case/punct-insensitive).
+    oih = _load_oi_history()
+    fields = ["Underlying", "Expiration Date", "Strike Price", "Call/Put",
+              "Cust Open Buy", "Cust Open Sell"]
+    assert oih._oc_col(fields, "underlying") == "Underlying"
+    assert oih._oc_col(fields, "expiry") == "Expiration Date"
+    assert oih._oc_col(fields, "strike") == "Strike Price"
+    assert oih._oc_col(fields, "cp") == "Call/Put"
+    assert oih._oc_col(fields, "cust_open_buy") == "Cust Open Buy"
+    assert oih._oc_col(fields, "cust_open_sell") == "Cust Open Sell"
+    assert oih._oc_col(fields, "nonexistent") is None
+
+
+def test_load_open_close_parses_and_validates(tmp_path):
+    # A well-formed CSV parses to canonical keys; a missing column raises ValueError.
+    oih = _load_oi_history()
+    good = tmp_path / "oc.csv"
+    good.write_text(
+        "underlying,expiry,strike,cp,cust_open_buy,cust_open_sell\n"
+        "SPY,2026-08-21,590,put,5000,1000\n"
+        "SPY,2026-08-21,600,call,200,3000\n"
+        "QQQ,2026-08-21,500,put,900,100\n")
+    rows = oih.load_open_close(str(good))
+    assert len(rows) == 3
+    r0 = rows[0]
+    assert r0["underlying"] == "SPY" and r0["cp"] == "put" and r0["strike"] == 590.0
+    assert r0["cust_open_buy"] == 5000.0 and r0["cust_open_sell"] == 1000.0
+
+    bad = tmp_path / "bad.csv"
+    bad.write_text("underlying,expiry,strike,cp\nSPY,2026-08-21,590,put\n")
+    with pytest.raises(ValueError):
+        oih.load_open_close(str(bad))
+
+
+def test_dealer_sign_report_put_assumption_supported():
+    # Customers net-BOUGHT puts (open buy > open sell) -> dealers SHORT puts ->
+    # the standard put_sign = -1 assumption is supported.
+    oih = _load_oi_history()
+    rows_in = [
+        {"underlying": "SPY", "expiry": "2026-08-21", "strike": 590.0, "cp": "put",
+         "cust_open_buy": 8000.0, "cust_open_sell": 1000.0},   # net +7000 cust buy
+        {"underlying": "SPY", "expiry": "2026-08-21", "strike": 600.0, "cp": "call",
+         "cust_open_buy": 500.0, "cust_open_sell": 4000.0},    # net -3500 cust (sold calls)
+    ]
+    rows, s = oih.dealer_sign_report(rows_in, "SPY", 20)
+    assert s["n_put_strikes"] == 1
+    assert s["n_put_dealer_short"] == 1
+    assert s["n_put_dealer_long"] == 0
+    assert s["net_customer_put_opening"] == 7000.0
+    assert s["assumption_holds"] is True
+    # Dealer sign is the OPPOSITE of the customer opening side.
+    put_row = next(r for r in rows if r[2] == "put")
+    assert put_row[5] == -1.0          # dealers SHORT the 590 put
+    call_row = next(r for r in rows if r[2] == "call")
+    assert call_row[5] == 1.0          # customers net-sold calls -> dealers LONG calls
+
+
+def test_dealer_sign_report_put_assumption_fails():
+    # Customers net-SOLD puts -> dealers LONG puts -> put_sign = -1 assumption FAILS.
+    oih = _load_oi_history()
+    rows_in = [
+        {"underlying": "SPY", "expiry": "2026-08-21", "strike": 590.0, "cp": "put",
+         "cust_open_buy": 500.0, "cust_open_sell": 9000.0},    # net -8500 cust (sold puts)
+    ]
+    rows, s = oih.dealer_sign_report(rows_in, "SPY", 20)
+    assert s["n_put_dealer_long"] == 1
+    assert s["net_customer_put_opening"] == -8500.0
+    assert s["assumption_holds"] is False
+    assert rows[0][5] == 1.0           # dealers LONG the 590 put
+
+
+def test_dealer_sign_report_filters_ticker():
+    # Rows for other underlyings are ignored.
+    oih = _load_oi_history()
+    rows_in = [
+        {"underlying": "QQQ", "expiry": "2026-08-21", "strike": 500.0, "cp": "put",
+         "cust_open_buy": 9000.0, "cust_open_sell": 100.0},
+    ]
+    rows, s = oih.dealer_sign_report(rows_in, "SPY", 20)
+    assert rows == []
+    assert s["n_put_strikes"] == 0
+
+
+def test_delta_report_grades_lean_by_opening_ratio(tmp_path, capsys):
+    # Free upgrade: the aggressor lean is graded/suppressed by dOI/volume. Build a
+    # two-day archive where one strike mostly OPENED (high ratio, lean kept) and
+    # another mostly CHURNED (low ratio, lean suppressed).
+    import csv
+    import gzip
+    import gex
+    oih = _load_oi_history()
+
+    def write_day(d, rows):
+        p = tmp_path / "SPY"
+        p.mkdir(exist_ok=True)
+        fp = p / (d + ".csv.gz")
+        with gzip.open(str(fp), "wt", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(gex.CHAIN_COLUMNS)
+            w.writerows(rows)
+    # Day 1: baseline OI.
+    write_day("2026-08-06", [
+        ["2026-08-06T16:00:00-0400", "2026-08-05", "SPY", 590.0, "2026-08-21", "put",
+         590.0, 1000, 20.0, 4.0, 4.2, 4.1, 5000],
+        ["2026-08-06T16:00:00-0400", "2026-08-05", "SPY", 590.0, "2026-08-21", "put",
+         580.0, 1000, 22.0, 2.0, 2.2, 2.1, 5000],
+    ])
+    # Day 2: 590 put OI +800 on volume 1000 (80% opened, last near ask -> lean kept);
+    #        580 put OI +800 on volume 9000 (9% opened -> churn -> lean suppressed).
+    write_day("2026-08-07", [
+        ["2026-08-07T16:00:00-0400", "2026-08-06", "SPY", 590.0, "2026-08-21", "put",
+         590.0, 1800, 20.0, 4.0, 4.2, 4.19, 1000],
+        ["2026-08-07T16:00:00-0400", "2026-08-06", "SPY", 590.0, "2026-08-21", "put",
+         580.0, 1800, 22.0, 2.0, 2.2, 2.19, 9000],
+    ])
+
+    rc = oih.delta_report(str(tmp_path), "SPY", 20, None)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The high-opening-ratio strike keeps a confidence-graded lean.
+    assert "HIGH conf" in out
+    # The churned strike's lean is suppressed (no SHORT/LONG gamma tag on its row).
+    churn_line = [ln for ln in out.splitlines() if "580" in ln]
+    assert churn_line and "dealer" not in churn_line[0]

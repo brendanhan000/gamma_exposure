@@ -85,10 +85,19 @@ METHODOLOGY AND ASSUMPTIONS  (made explicit here, in-code, and in the output)
     sticky-delta (the smile follows moneyness as spot moves), so the flip is an
     estimate under a stated vol-dynamics assumption, not a model-free level.
 
-(5) WALLS:
-    Call wall  = strike with the largest POSITIVE net GEX (pin / resistance).
-    Put wall   = strike with the largest NEGATIVE net GEX (support that becomes
-                 a downside accelerant once breached).
+    TIME-DECAY CAVEAT: the flip is computed at the CURRENT T and is NOT static.
+    As T decays toward the close, ATM gamma (~1/sqrt(T)) grows and the zero-gamma
+    level migrates -- materially so for 0DTE-heavy chains. The output therefore
+    also reports the flip projected at the 16:00 ET close (every contract's T
+    advanced, K/sigma/OI held fixed) so the migration is visible, not hidden.
+
+(5) WALLS  (per-side, industry convention):
+    Call wall  = strike with the largest CALL-side dollar gamma (pin / resistance).
+    Put wall   = strike with the largest PUT-side dollar gamma, in absolute terms
+                 (support that becomes a downside accelerant once breached).
+    Walls are computed PER-SIDE, not from net GEX: a strike with huge call AND
+    put OI nets to ~zero but still carries enormous gross gamma and acts as a
+    real pin, so netting would hide it. Each wall measures its own side's size.
 
 (6) REGIME:
     spot > flip  -> dealers net LONG gamma  -> vol-dampening / mean-reverting.
@@ -457,20 +466,86 @@ def _flip_with_put_sign(contracts, spot, cfg, put_sign):
     return find_flip_level(contracts, spot, conv, cfg)["flip"]
 
 
+def _decayed_contracts(contracts, decay_seconds):
+    """Return copies of `contracts` with time-to-expiry advanced by decay_seconds.
+
+    Used for the flip time-decay projection: the flip is not static -- as T
+    decays, ATM gamma (~1/sqrt(T)) grows and the zero-gamma level migrates. We
+    recompute each contract's T as of a later wall-clock moment (e.g. the 16:00
+    ET close) holding K, sigma, OI fixed, drop any that expire in the interval,
+    and floor the survivors at the same T_FLOOR used for the live snapshot so
+    the projection is numerically consistent with the live number.
+    """
+    out = []
+    for c in contracts:
+        secs = c.T * (DAY_COUNT * 24.0 * 3600.0) - decay_seconds
+        if secs <= 0:
+            continue                      # expires before the projection horizon
+        secs = max(secs, T_FLOOR_SECONDS)
+        out.append(Contract(c.strike, c.expiry, c.cp, c.oi, c.iv,
+                            T=secs / (DAY_COUNT * 24.0 * 3600.0)))
+    return out
+
+
+def flip_time_decay(contracts, spot, cfg, now):
+    """Project where the gamma flip migrates by the 16:00 ET close (time decay).
+
+    The headline flip is computed at the CURRENT T. For 0DTE-heavy chains the
+    flip moves materially through the session as T -> 0 (ATM gamma ~ 1/sqrt(T)).
+    This recomputes the flip with every contract's T advanced to the close,
+    holding K / sigma / OI fixed. Returns a dict:
+        flip_now    : flip at current T (None if no crossing)
+        flip_close  : flip at close-of-day T (None if no crossing / no contracts)
+        move        : flip_close - flip_now (None if either is None)
+        seconds     : seconds from `now` to the 16:00 ET close (<=0 after close)
+    After the close (or with no time left) `flip_close` is None and `seconds`<=0.
+    """
+    secs_to_close = seconds_to_expiry(now.date(), now)
+    flip_now = find_flip_level(contracts, spot, cfg.convention, cfg)["flip"]
+    if secs_to_close <= 0 or not contracts:
+        return {"flip_now": flip_now, "flip_close": None, "move": None,
+                "seconds": secs_to_close}
+    decayed = _decayed_contracts(contracts, secs_to_close)
+    if not decayed:
+        return {"flip_now": flip_now, "flip_close": None, "move": None,
+                "seconds": secs_to_close}
+    flip_close = find_flip_level(decayed, spot, cfg.convention, cfg)["flip"]
+    move = (flip_close - flip_now) if (flip_now is not None and flip_close is not None) else None
+    return {"flip_now": flip_now, "flip_close": flip_close, "move": move,
+            "seconds": secs_to_close}
+
+
 def find_walls(profile):
-    """Call wall = strike of max (most positive) net GEX; put wall = strike of min."""
+    """Call wall = strike with the largest CALL-side gamma; put wall = strike
+    with the largest PUT-side gamma (in absolute terms).
+
+    INDUSTRY CONVENTION: walls are computed PER-SIDE, not from net GEX. Net GEX
+    at a strike is (call_gex - put_gex) under the standard convention, so a
+    strike with huge call OI AND huge put OI nets to ~zero and would never be a
+    wall -- even though it carries enormous gross gamma and acts as a real pin.
+    Computing each wall from its own side measures the actual size of call
+    positioning (resistance/pin) and put positioning (support/accelerant)
+    independently, which is what the wall labels mean.
+
+    The signed convention still applies within each side: call GEX is positive
+    under the standard convention (dealers long calls), put GEX is negative
+    (dealers short puts). So the call wall is the strike of MAX call_gex and
+    the put wall is the strike of MIN (most negative) put_gex. The reported
+    *_gex values are the signed per-side contributions at those strikes.
+    """
     strikes = profile["strikes"]
-    net = profile["net"]
+    call_gex = profile["call_gex"]
+    put_gex = profile["put_gex"]
     if strikes.size == 0:
         return {"call_wall": None, "call_wall_gex": None,
                 "put_wall": None, "put_wall_gex": None}
-    i_call = int(np.argmax(net))
-    i_put = int(np.argmin(net))
+    i_call = int(np.argmax(call_gex))   # largest positive call-side gamma
+    i_put = int(np.argmin(put_gex))     # largest (most negative) put-side gamma
     return {
         "call_wall": float(strikes[i_call]),
-        "call_wall_gex": float(net[i_call]),
+        "call_wall_gex": float(call_gex[i_call]),
         "put_wall": float(strikes[i_put]),
-        "put_wall_gex": float(net[i_put]),
+        "put_wall_gex": float(put_gex[i_put]),
     }
 
 
@@ -922,10 +997,16 @@ def fmt_px(x):
 # ===========================================================================
 # Per-view computation
 # ===========================================================================
-def compute_view(contracts, spot, cfg):
-    """Run the full pipeline for one slice of the chain (0DTE / all / a date)."""
+def compute_view(contracts, spot, cfg, now=None):
+    """Run the full pipeline for one slice of the chain (0DTE / all / a date).
+
+    `now` (defaults to now_et()) anchors the flip time-decay projection: the
+    flip is recomputed at the 16:00 ET close so the output shows where the level
+    migrates as T decays, not just where it sits at the snapshot instant.
+    """
     if not contracts:
         return {"empty": True, "n": 0}
+    now = now_et() if now is None else now
     profile = compute_gex_profile(contracts, spot, cfg.convention, cfg)
     walls = find_walls(profile)
     flip_std = find_flip_level(contracts, spot, cfg.convention, cfg)
@@ -941,6 +1022,7 @@ def compute_view(contracts, spot, cfg):
         for scale in (0.5, 1.5):
             flip_band[scale] = _flip_with_put_sign(contracts, spot, cfg, base_put * scale)
     gross = gross_dollar_gamma(contracts, spot, cfg)
+    decay = flip_time_decay(contracts, spot, cfg, now)
     return {
         "empty": False,
         "n": len(contracts),
@@ -949,6 +1031,7 @@ def compute_view(contracts, spot, cfg):
         "flip_std": flip_std,
         "flip_flipped": flip_flp,
         "flip_band": flip_band,
+        "flip_decay": decay,
         "total": profile["total"],
         "gross": gross,
     }
@@ -1139,7 +1222,7 @@ def print_view_detail(label, view, spot, spy_ratio, cfg, today):
         print("    No zero crossing within +/-{:.0%}. Total GEX at spot = {} ({} regime)."
               .format(cfg.price_range, fmt_bn(tot), "LONG" if tot > 0 else "SHORT"))
     else:
-        print("    {}  {:,.2f}".format(cfg.ticker, flip))
+        print("    {}  {:,.2f}   (as of NOW)".format(cfg.ticker, flip))
         eq = cross_quote(cfg.ticker, flip, spy_ratio)
         if eq:
             print("    {}-equiv  {:,.2f}   (SPX/SPY ratio {:.3f})".format(eq[0], eq[1], spy_ratio))
@@ -1148,10 +1231,29 @@ def print_view_detail(label, view, spot, spy_ratio, cfg, today):
             print("    NOTE: {} crossings in range [{}]; reporting the one nearest spot."
                   .format(view["flip_std"]["crossings"].size, extra))
 
-    # ---- Walls (#3, #4) ----
-    print("  Call wall [#3] (resistance/pin): {} {}   net GEX {}".format(
+    # ---- Flip time-decay projection (#2a): the flip is NOT static ----
+    decay = view.get("flip_decay") or {}
+    fc, mv, secs = decay.get("flip_close"), decay.get("move"), decay.get("seconds", 0)
+    if secs and secs > 0:
+        h, m = int(secs // 3600), int((secs % 3600) // 60)
+        if fc is not None and mv is not None:
+            print("    Flip at 16:00 close (T-decayed): {:,.2f}   (migrates {:+.2f}, {:+.2f}%, in {}h{:02d}m)"
+                  .format(fc, mv, mv / spot * 100.0, h, m))
+            print("      => the flip is NOT static: it drifts as T decays; plan around the path,")
+            print("         not just the snapshot level.")
+        elif flip is not None:
+            print("    Flip at 16:00 close (T-decayed): no crossing by the close (decays away).")
+    # After the close there is no decay projection to show (0DTE has settled).
+
+    # 0DTE OI-staleness escalation, adjacent to the flip it undermines.
+    if _is_0dte_label(label) and flip is not None:
+        print("    *** 0DTE STALENESS: flip built on LAST NIGHT's OI; today's intraday 0DTE")
+        print("        positioning (often most of the day's gamma) is NOT reflected. ***")
+
+    # ---- Walls (#3, #4): per-side (call wall from call gamma, put wall from put gamma) ----
+    print("  Call wall [#3] (resistance/pin): {} {}   call-side GEX {}".format(
         cfg.ticker, fmt_px(walls["call_wall"]), fmt_bn(walls["call_wall_gex"])))
-    print("  Put wall  [#4] (support/accel):  {} {}   net GEX {}".format(
+    print("  Put wall  [#4] (support/accel):  {} {}   put-side GEX {}".format(
         cfg.ticker, fmt_px(walls["put_wall"]), fmt_bn(walls["put_wall_gex"])))
 
     # ---- Sensitivity / LOW CONFIDENCE (guardrail) ----
@@ -1200,6 +1302,10 @@ def print_view_detail(label, view, spot, spy_ratio, cfg, today):
     print()
 
 
+def _is_0dte_label(label):
+    return "0DTE" in label.upper()
+
+
 def render_summary(label, view, spot, spy_ratio, cfg, today):
     """The required plain-text bias block (#6)."""
     print("#" * 78)
@@ -1207,7 +1313,7 @@ def render_summary(label, view, spot, spy_ratio, cfg, today):
     print("#" * 78)
     if view.get("empty"):
         print("  No bias: {}.".format(explain_empty_view(label, today)))
-        if "0DTE" in label.upper():
+        if _is_0dte_label(label):
             print("  Use the ALL EXPIRIES view for tonight; fresh 0DTE appears after tomorrow's open.")
         print("#" * 78)
         print()
@@ -1230,6 +1336,14 @@ def render_summary(label, view, spot, spy_ratio, cfg, today):
     print("  Put wall .......... {} {}".format(cfg.ticker, fmt_px(walls["put_wall"])))
     print("  Total net GEX ..... {}  ({})".format(fmt_bn(view["total"]), fmt_usd(view["total"])))
     print("  Interpretation .... " + interpretation_line(spot, flip, view["total"]))
+    # 0DTE OI-staleness escalation: the 0DTE flip is built on end-of-prior-session
+    # OI that EXCLUDES everything opened intraday today -- on a big 0DTE day that
+    # is most of the gamma. Surface this at the headline level, not just in the
+    # data-health block, so the precise-looking flip number is not over-trusted.
+    if _is_0dte_label(label) and flip is not None:
+        print("  *** 0DTE CAVEAT ... this flip uses LAST NIGHT's OI; today's intraday")
+        print("      0DTE positioning (often most of the day's gamma) is NOT in it.")
+        print("      Treat the 0DTE flip/regime as a stale lower bound, not a live level.")
     print("#" * 78)
     print()
 

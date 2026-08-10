@@ -224,6 +224,10 @@ def _view_json(label, view, spot, spy_ratio, cfg, today=None):
         low_conf = False
     eq = gex.cross_quote(cfg.ticker, flip, spy_ratio) if flip is not None else None
 
+    decay = view.get("flip_decay") or {}
+    flip_close = decay.get("flip_close")
+    flip_move = decay.get("move")
+
     strikes = view["profile"]["strikes"]
     net = view["profile"]["net"]
     m = (strikes >= spot * (1 - PROFILE_WINDOW)) & (strikes <= spot * (1 + PROFILE_WINDOW))
@@ -236,9 +240,12 @@ def _view_json(label, view, spot, spy_ratio, cfg, today=None):
         "regime": gex.regime_word(spot, flip),
         "flip": flip,
         "flip_equiv": {"ticker": eq[0], "level": round(eq[1], 2)} if eq else None,
+        "flip_close": round(flip_close, 2) if flip_close is not None else None,
+        "flip_close_move": round(flip_move, 2) if flip_move is not None else None,
         "crossings": [round(float(c), 2) for c in view["flip_std"]["crossings"]],
         "flip_flipped": view["flip_flipped"]["flip"],
         "low_confidence": low_conf,
+        "is_0dte": "0DTE" in label.upper(),
         "call_wall": walls["call_wall"], "call_wall_gex": walls["call_wall_gex"],
         "put_wall": walls["put_wall"], "put_wall_gex": walls["put_wall_gex"],
         "interpretation": gex.interpretation_line(spot, flip, view["total"]),
