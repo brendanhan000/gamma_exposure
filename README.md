@@ -192,6 +192,41 @@ Market holidays are not skipped — you get the prior session's levels.
 
 ---
 
+## Open-interest history & empirical dealer sign
+
+Every live run archives the raw chain to `chains/<TICKER>/<date>.csv.gz` (OI is never backfillable, so an
+unsaved day is lost forever). `scripts/oi_history.py` turns that archive into two things a single snapshot
+cannot give you:
+
+```bash
+python3 scripts/oi_history.py                          # archive inventory
+python3 scripts/oi_history.py --ticker SPY             # day-over-day dOI report
+python3 scripts/oi_history.py --ticker SPY --open-close cboe_oc.csv
+```
+
+- **dOI report** — where positioning is *building* vs. stale OI that has sat for weeks. The crude aggressor
+  lean (last print near ask → customers bought → dealers short that strike's gamma) is **graded by the
+  opening ratio `dOI/volume`**: a high ratio means the day's flow mostly *opened* (trustworthy), a low ratio
+  means mostly churn, so the lean is **suppressed as noise** instead of shown as false signal.
+- **Empirical dealer sign (`--open-close`)** — the model's `put_sign = -1` assumption is its biggest
+  weakness. CBOE Open-Close data splits volume into opening/closing × buy/sell × origin (customer / firm /
+  market-maker), so **net customer put buying ⇒ dealers short those puts**. Point it at a CBOE open-close
+  CSV and it reports the empirical dealer sign per strike and a verdict on whether the standard assumption
+  is **supported or fails** on that snapshot:
+
+  ```
+  PUT SIDE (the put_sign = -1 assumption under test):
+    put strikes with dealers SHORT: 2   LONG: 1
+    net customer put opening: +8,100 contracts
+    => customers NET-BOUGHT puts: dealers are net SHORT put gamma.
+       The standard put_sign = -1 assumption is SUPPORTED by this data.
+  ```
+
+  Caveat: CBOE captures only its own exchanges' share of volume (multi-listed options trade on up to 17
+  venues) — directionally informative, not the whole market.
+
+---
+
 ## Methodology
 
 ### 1. BSM (Merton) gamma — identical for calls and puts
@@ -237,27 +272,41 @@ Flippable via `--convention flipped` or `--call-sign` / `--put-sign`. Ground tru
 dealer-direction data (e.g. CBOE open-close), which this feed does not provide — so the tool quantifies its
 exposure to the assumption instead of pretending.
 
-### 4. Gamma flip — found by root-finding, not lookup
+### 4. Gamma flip — found by root-finding, and projected forward in time
 
 Total net GEX is **repriced across a 1,000-point grid of hypothetical spot prices** (±10%), recomputing both
-`Γ(S')` **and** the `S'²` dollar term at each node. Sign changes between adjacent nodes are resolved by
-linear interpolation:
-
-```
-x = x0 - y0 * (x1 - x0) / (y1 - y0)
-```
+`Γ(S')` **and** the `S'²` dollar term at each node. Each bracketed sign change is then refined to machine
+precision with **Brent's method** (the 0DTE curve is near-discontinuous, so linear interpolation across a
+wide grid cell is a poor model).
 
 The curve can legitimately cross zero **more than once** — all crossings are detected, the nearest to spot
 is reported, and the rest are listed. Repricing holds each strike's IV fixed (**sticky-strike**); reality
 sits between sticky-strike and sticky-delta, so the flip is an estimate under a stated vol-dynamics
 assumption, not a model-free level.
 
+**The flip is not static.** It is computed at the current `T`, but as `T → 0` the ATM gamma (`~1/√T`) grows
+and the zero-gamma level migrates — materially so for 0DTE-heavy chains. Every run therefore also reports the
+flip **projected at the 16:00 ET close** (each contract's `T` advanced, `K`/`σ`/OI held fixed) with the
+signed migration, so the drift is visible rather than hidden:
+
+```
+Gamma flip / zero-gamma level [#2]:
+  SPY  591.38   (as of NOW)
+  Flip at 16:00 close (T-decayed): 592.52   (migrates +1.13, +0.19%, in 3h00m)
+    => the flip is NOT static: it drifts as T decays; plan around the path,
+       not just the snapshot level.
+```
+
 ### 5. Walls and regime
+
+Walls are computed **per-side** (industry convention), not from net GEX. Net GEX at a strike is
+`call − put`, so a strike with huge call *and* put OI nets to ~zero yet still carries enormous gross gamma
+and acts as a real pin — netting would hide it. Each wall measures its own side's size:
 
 | Output | Definition | Meaning |
 |---|---|---|
-| **Call wall** | Strike with the largest **positive** net GEX | Resistance / pin |
-| **Put wall** | Strike with the largest **negative** net GEX | Support that becomes a downside **accelerant** if breached |
+| **Call wall** | Strike with the largest **call-side** dollar gamma | Resistance / pin |
+| **Put wall** | Strike with the largest **put-side** dollar gamma (absolute) | Support that becomes a downside **accelerant** if breached |
 | **Regime** | `spot > flip` → LONG gamma<br>`spot < flip` → SHORT gamma | Long: vol-damping, mean-reverting.<br>Short: vol-amplifying, trend-prone. |
 
 ---
@@ -268,8 +317,13 @@ assumption, not a model-free level.
   gamma positive, i.e. the flip vanishes — an honest signal that it exists *only* under the short-put
   assumption) **and** under a graded **±50% change in short-put magnitude**, which yields an actual "how far
   does it move" number. A **LOW CONFIDENCE** warning prints when the flip moves more than **1% of spot**.
-- **OI staleness.** Open interest updates once daily (overnight, OCC EOD). The reference date is printed
-  with a clear caveat that **0DTE GEX lags** — today's freshly-opened 0DTE flow is *not* in this OI.
+- **OI staleness — escalated for 0DTE.** Open interest updates once daily (overnight, OCC EOD). The
+  reference date is printed with a clear caveat that **0DTE GEX lags** — today's freshly-opened 0DTE flow is
+  *not* in this OI. Because that missing intraday flow is often *most* of the day's 0DTE gamma, a prominent
+  `*** 0DTE CAVEAT ***` is printed **next to the 0DTE flip itself** (and in its bias summary), not just in
+  the data-health block — so the precise-looking 0DTE level is not over-trusted.
+- **Flip time-decay.** The flip migrates as `T` decays; the close-of-day projection (above) makes that
+  drift explicit instead of presenting the flip as a fixed level.
 - **Gamma by expiry.** The hedging-urgency decomposition shown above.
 - **Quote-quality filters.** Crossed quotes (bid > ask) dropped anywhere; **deep-ITM** contracts (>5% ITM)
   with no bid or a relative spread >25% dropped — their IV comes from a sliver of extrinsic value and is
@@ -297,8 +351,11 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 ## Limitations (read before trading on this)
 
 - The **dealer sign convention is an assumption**, and the flip's *existence* depends on it. Biggest
-  weakness — treat the regime as directional context, not a precise tradeable level.
-- **OI is end-of-prior-session**; the intraday 0DTE picture is necessarily stale.
+  weakness — treat the regime as directional context, not a precise tradeable level. It can now be **tested
+  empirically** against CBOE open-close data (`scripts/oi_history.py --open-close`), which reports whether
+  dealers are actually net short puts on a given day.
+- **OI is end-of-prior-session**; the intraday 0DTE picture is necessarily stale (flagged prominently on
+  the 0DTE view).
 - **Single-underlying scope.** A full S&P dealer book aggregates SPX + SPXW + XSP + SPY + ES normalized to
   common notional. Schwab has no index OI and no futures options, so this measures **one listed underlying**
   as a correlated proxy. Raw GEX is deliberately never summed across underlyings.
@@ -311,21 +368,22 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 
 ## Repository map
 
-| Path | Lines | Role |
-|---|---|---|
-| `gex.py` | 1,489 | Quant core + Schwab data layer + rendering + CLI |
-| `test_gex.py` | 447 | 25 pytest cases (no network) |
-| `server.py` | 373 | FastAPI JSON API, caching, client lifecycle |
-| `static/index.html` | 262 | Installable iOS PWA |
-| `scripts/schwab_setup.py` | 145 | One-time OAuth login + live verification |
-| `scripts/daily_gex.sh` | 110 | Multi-cadence notifier |
-| `scripts/*.plist` | 4 files | launchd agents (3 push cadences + API server) |
-| `GEX_Technical_Reference.pdf` | 20 pp | Full technical documentation |
+| Path | Role |
+|---|---|
+| `gex.py` | Quant core + Schwab data layer + rendering + CLI |
+| `test_gex.py` | 47 pytest cases (no network) |
+| `server.py` | FastAPI JSON API, caching, client lifecycle |
+| `static/index.html` | Installable iOS PWA |
+| `scripts/schwab_setup.py` | One-time OAuth login + live verification |
+| `scripts/oi_history.py` | Chain-archive dOI analysis + CBOE open-close dealer-sign test |
+| `scripts/daily_gex.sh` | Multi-cadence notifier |
+| `scripts/*.plist` | 4 launchd agents (3 push cadences + API server) |
+| `GEX_Technical_Reference.pdf` | Full technical documentation |
 
 ## Tests
 
 ```bash
-python3 -m pytest test_gex.py -v      # 25 tests, < 1s, no network
+python3 -m pytest test_gex.py -v      # 47 tests, no network
 ```
 
 Validation is against **independently derived truth**, not recorded output:
@@ -336,5 +394,12 @@ Validation is against **independently derived truth**, not recorded output:
 - **`find_flip_level`** against a hand-derived analytical crossing: for one call at `Kc` and one put at `Kp`
   with equal OI and matching σ/T, the common factors cancel at the zero, giving
   `S* = √(Kc·Kp)·e^(-cT)` — the grid search must land on **97.5288**.
+- **Per-side walls**: a strike with huge call *and* put gamma (net ≈ 0) must still be found as both walls —
+  the regression the net-based definition missed.
+- **Flip time-decay**: the close-of-day projection returns both the current and T-decayed flip, drops
+  contracts that expire inside the window, and floors tiny `T` consistently with the live snapshot.
+- **0DTE staleness escalation**: the caveat fires on 0DTE views with a flip and never on other views.
+- **Empirical dealer sign**: open-close CSV parsing (flexible vendor column spellings), the
+  customer⇒dealer sign inversion, and the supported/fails verdict in both directions.
 - Plus: quote-filter behavior (including **wing preservation**), OpEx calendar arithmetic, retry
   classification (transient vs. auth), and cross-process token-lock exclusivity via a real subprocess.
