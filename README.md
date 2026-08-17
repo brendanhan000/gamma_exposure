@@ -102,6 +102,82 @@ Schwab market data is **free with a brokerage account** — no per-asset entitle
 > renewal path. The tool warns from day 5.5 in every push, and failures are labelled
 > `SCHWAB TOKEN EXPIRED` with the exact command to run.
 
+### Token reliability — read this if tokens die early
+
+Weekly re-login is **unavoidable** (Schwab policy: refresh tokens older than seven days are
+rejected, with no way to extend them). But a token dying in *hours* is a different problem
+with a specific cause:
+
+> ⚠️ **Any process still holding the OLD token will revoke your NEW one.**
+> Schwab treats a superseded refresh token as a compromise signal and revokes the entire
+> token family — including the token you just created. A long-lived `server.py` from
+> yesterday is enough to kill every fresh login you make.
+
+**Always check before re-authenticating:**
+
+```bash
+gexps                       # lists anything holding the token
+pkill -f "server.py"        # only if it found something
+gexauth --manual            # then re-login
+```
+
+**When a token dies, diagnose it instead of guessing:**
+
+```bash
+gexaudit                    # verdict from the token journal
+gexaudit --all --hours 48   # full history
+```
+
+Every token read and write is journaled to `logs/token_audit.log` with the PID, command,
+and a **sha256 fingerprint** of the refresh token (enough to see rotation, never the secret
+itself). `scripts/token_audit.py` reads it and names the pattern: `STALE REUSE` (which
+process presented a superseded token, and when), `CONCURRENCY`, or `RAPID ROTATE`. If it
+finds none of those, the cause was *not* a local race — suspect the 7-day cap or a
+second login elsewhere.
+
+Two safeguards run automatically:
+
+- **Atomic token writes.** `schwab-py`'s default writer opens the token with mode `'w'`,
+  truncating it before writing — a crash or two overlapping writers leaves a corrupt token
+  that Schwab rejects. Writes now go to a temp file (`fsync`) then `os.replace`, which is
+  atomic on POSIX: a reader sees the old token or the new one, never a partial.
+- **Staleness re-checked inside the lock.** Checking before acquiring the lock is a
+  check-then-act race: another process can rotate the token in that window, after which
+  this client holds a superseded one. The check now happens immediately before every API
+  call, and a rotated token is reloaded from disk.
+
+---
+
+## Shell helpers (recommended)
+
+The tool needs three things lined up every time: the right interpreter (the system
+`python3` has no numpy, and `schwab-py` needs ≥ 3.10), the project directory, and
+credentials loaded from `.env`. These `~/.zshrc` functions handle all three, and work
+from **any** directory:
+
+```bash
+export GEX_HOME="/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure"
+export PY="/opt/anaconda3/bin/python"
+
+gex()       { ( cd "$GEX_HOME" && set -a && . ./.env && set +a && "$PY" gex.py "$@" ); }
+gexserver() { ( cd "$GEX_HOME" && set -a && . ./.env && set +a && "$PY" server.py "$@" ); }
+gexauth()   { ( cd "$GEX_HOME" && set -a && . ./.env && set +a && "$PY" scripts/schwab_setup.py "$@" ); }
+gexoi()     { ( cd "$GEX_HOME" && set -a && . ./.env && set +a && "$PY" scripts/oi_history.py "$@" ); }
+gexaudit()  { ( cd "$GEX_HOME" && "$PY" scripts/token_audit.py "$@" ); }
+gexps()     { pgrep -fl "server.py|gex.py" || echo "no gex processes running"; }
+```
+
+Each runs in a **subshell**, so your working directory and environment are untouched.
+After editing `~/.zshrc`, run `source ~/.zshrc` in already-open terminals (new ones pick
+them up automatically).
+
+```bash
+gex --ticker QQQ --expiry 2026-08-21      # instead of: cd … && set -a && source .env && …
+```
+
+> Without these, `$PY` is undefined in a fresh terminal and `$PY gex.py …` collapses to
+> `gex.py …` → `zsh: command not found: gex.py`.
+
 ---
 
 ## Usage
@@ -112,7 +188,7 @@ python3 gex.py --ticker QQQ          # any optionable underlying with listed OI
 python3 gex.py --expiry 0dte         # single view
 python3 gex.py --expiry 2026-08-21   # a specific expiration
 python3 gex.py --expiry all --all-days 90        # widen the expiration window
-python3 gex.py --rate 0.043 --div-yield 0.012    # override r and q
+python3 gex.py --rate 0.0469 --div-yield 0.012   # override r and q
 python3 gex.py --convention flipped  # flip the dealer sign assumption
 python3 gex.py --levels-only         # compact output (used by notifications)
 python3 gex.py --demo                # offline synthetic chain
@@ -121,7 +197,7 @@ python3 gex.py --demo                # offline synthetic chain
 **Flags:** `--ticker` · `--expiry` · `--all-days` (default 45; wider risks a vendor 502) · `--rate` ·
 `--div-yield` (auto per-ticker if omitted) · `--multiplier` · `--price-range` (±10% flip window) ·
 `--steps` · `--convention` / `--call-sign` / `--put-sign` · `--x-tick` (chart gridlines, default 10) ·
-`--no-plot` · `--out-prefix` · `--levels-only` · `--token-path` · `--demo`. Full list: `python3 gex.py --help`.
+`--no-plot` · `--out-prefix` · `--levels-only` · `--profiles` · `--watch N` · `--token-path` · `--demo`. Full list: `python3 gex.py --help`.
 
 ### When to run what
 
@@ -149,11 +225,31 @@ On your iPhone (same Wi-Fi): open `http://<mac-lan-ip>:8787` in Safari → Share
 Dark standalone app with regime banner, LOW-CONFIDENCE badge, level cards, per-strike canvas chart, and the
 expiry-bucket table.
 
-**API:** `GET /api/gex?ticker=&expiry=both|0dte|all|YYYY-MM-DD&all_days=` · `GET /api/expirations?ticker=` ·
-`GET /api/health` · interactive docs at `/docs`.
+**API:** `GET /api/gex?ticker=&expiry=both|0dte|all|YYYY-MM-DD&all_days=&fresh=0|1` ·
+`GET /api/expirations?ticker=` · `GET /api/health` · interactive docs at `/docs`.
 
-Results cache for 60s; the server rebuilds its Schwab client when the token file changes, so it heals itself
-after a re-login with no restart. LAN-only by default — for remote access, use Tailscale on both devices.
+Results cache for 60s unless `fresh=1` (the app's refresh button always sends it, so spot and IV are
+never a replayed snapshot). The server rebuilds its Schwab client when the token file changes, so it
+heals itself after a re-login with no restart. LAN-only by default — for remote access, use Tailscale
+on both devices.
+
+### Re-authenticate from the phone — `/setup.html`
+
+Since the weekly re-login is permanent, it doesn't have to mean finding a laptop:
+
+**`http://<mac-lan-ip>:8787/setup.html`** → tap **START LOGIN** → approve on Schwab → you land on a
+"can't open the page" error (expected) → copy the address bar → paste → **INSTALL TOKEN**.
+
+The server exchanges the code, writes the token atomically, drops its cached client, clears caches, and
+reports days remaining. Two ways to reach it without typing the URL: the header token indicator is
+tappable and turns **amber inside the last 1.5 days**, and any auth failure shows a
+**"Re-authenticate now →"** link.
+
+Endpoints: `GET /api/auth/start` (returns the authorize URL) · `POST /api/auth/complete`
+(`{"redirect_url": "…"}`). The app secret never leaves the server — the browser only handles the
+short-lived authorization code, exactly as in the CLI flow. The exchange holds the token lock, and the
+result is validated: a token written without a refresh token is rejected immediately rather than dying
+30 minutes later.
 
 **Always-on service:**
 ```bash
@@ -243,7 +339,7 @@ d1    = [ ln(S/K) + (r - q + sigma^2/2) * T ] / (sigma * sqrt(T))
   `390×252` clock breaks that pairing and inflates 0DTE gamma severalfold. A trading-time clock is correct
   only when IV is re-derived under the same clock.
 - **`T` is floored at 5 minutes**, because gamma carries `S·σ·√T` in the denominator and diverges as `T → 0`.
-- **`q` auto-resolves per ticker** (SPY 1.2%, QQQ 0.6%) with its provenance printed; `r` defaults to 0.043
+- **`q` auto-resolves per ticker** (SPY 1.2%, QQQ 0.6%) with its provenance printed; `r` defaults to 0.0469
   and is always echoed.
 - **Exercise style:** European gamma is used for American ETF options. The early-exercise premium
   concentrates in deep-ITM (low-gamma) strikes and is small for the short-dated flow that dominates GEX.
@@ -331,6 +427,61 @@ and acts as a real pin — netting would hide it. Each wall measures its own sid
   strikes always dropped. All drop counts printed.
 - **Never crashes on a thin chain.** Degenerate inputs return 0, never NaN or infinity.
 
+## Dual profile: trading layer vs structural layer
+
+```bash
+python3 gex.py --ticker QQQ --profiles      # both layers, side by side
+python3 gex.py --ticker QQQ --watch 60      # recompute the intraday layer every 60s
+```
+
+The same contract set answers two different questions, and conflating them is a modeling
+error. `--profiles` runs both:
+
+| | **INTRADAY** (trading layer) | **STRUCTURAL** (overview layer) |
+|---|---|---|
+| **Scope** | 0DTE → front week **+ next monthly OpEx** | Every expiry in the window |
+| **Weighting** | **OI blended with today's volume** | **OI only** |
+| **Why** | That's where essentially all real-time hedging pressure lives | Durable positioning, not today's churn |
+| **Behavior** | Moves continuously — recompute on a fast cadence | Barely moves day to day; that's the point |
+| **Use for** | Today's tradeable flip and nearest walls | Multi-day walls and the regime flip |
+
+**The volume blend is the single biggest intraday fix.** Prior-close OI is stale by
+mid-morning on 0DTE and systematically understates the gamma actually driving the tape.
+Weighting: **volume × 1.0 for 0DTE**, **× 0.5 through the front week**, **× 0.0 beyond**.
+
+> **Stated assumption:** traded volume includes *closing* as well as opening trades, so the
+> blend is an **upper bound** on fresh positioning. It deliberately biases toward
+> over-counting near-dated activity, because understating live 0DTE gamma is the larger error.
+> The output prints the **volume uplift** (`+159.5%` on a recent QQQ run) so you can see
+> exactly how much the blend changed versus OI alone.
+
+**Per-expiry vol is preserved** — in fact the tool goes further and uses **per-strike** IV, so
+front-week and monthly vols are never collapsed into one point that would smear the flip.
+
+**The 0DTE decay cliff is surfaced explicitly.** The intraday profile warns what fraction of
+itself expires at 16:00 ET and how long remains:
+
+```
+*** 0DTE DECAY CLIFF: 34% of this profile (218 contracts) expires
+    at 16:00 ET -- 2h 41m left. These levels are valid only until then.
+```
+
+**Layer agreement is checked.** When the two flips differ by more than 1% of spot, the output
+says the near-dated book is pulling the flip away from the standing structure — trade the
+intraday level, but expect it to snap back toward the structural one once front-dated gamma
+expires. When they agree, the intraday flip is anchored by durable structure and deserves more
+confidence. (This is also the natural cross-check against an external regime model: the
+structural flip and your regime state should broadly agree, and divergence is worth a look.)
+
+**`--watch N`** re-fetches every N seconds and prints one line per tick with spot/flip/walls
+and the change since the last tick — because a level computed at 09:35 is not the level at 13:00:
+
+```
+17:44:21  spot 729.87  flip 730.28  walls 735.00/730.00  net -0.342 $Bn  spot +0.00  flip -0.00
+```
+
+---
+
 ## The governing rule: match the expiry set to your holding period
 
 The discipline almost nobody applies. GEX from the wrong expiry set is noise for your horizon:
@@ -370,20 +521,24 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 
 | Path | Role |
 |---|---|
-| `gex.py` | Quant core + Schwab data layer + rendering + CLI |
-| `test_gex.py` | 47 pytest cases (no network) |
-| `server.py` | FastAPI JSON API, caching, client lifecycle |
-| `static/index.html` | Installable iOS PWA |
-| `scripts/schwab_setup.py` | One-time OAuth login + live verification |
+| `gex.py` | Quant core + Schwab data layer + token persistence + rendering + CLI |
+| `test_gex.py` | 53 pytest cases (no network) |
+| `server.py` | FastAPI JSON API, caching, client lifecycle, phone re-auth endpoints |
+| `static/index.html` | Installable iOS PWA (levels) |
+| `static/setup.html` | Phone-based Schwab re-authentication |
+| `scripts/schwab_setup.py` | Terminal OAuth login + token validation + live verification |
 | `scripts/oi_history.py` | Chain-archive dOI analysis + CBOE open-close dealer-sign test |
+| `scripts/token_audit.py` | Diagnoses early token expiry from the token journal |
 | `scripts/daily_gex.sh` | Multi-cadence notifier |
 | `scripts/*.plist` | 4 launchd agents (3 push cadences + API server) |
+| `chains/` | Chain archive — **not regenerable, back this up** (git-ignored) |
+| `logs/token_audit.log` | Token read/write journal (fingerprints only, no secrets) |
 | `GEX_Technical_Reference.pdf` | Full technical documentation |
 
 ## Tests
 
 ```bash
-python3 -m pytest test_gex.py -v      # 47 tests, no network
+python3 -m pytest test_gex.py -v      # 53 tests, no network
 ```
 
 Validation is against **independently derived truth**, not recorded output:
@@ -401,5 +556,10 @@ Validation is against **independently derived truth**, not recorded output:
 - **0DTE staleness escalation**: the caveat fires on 0DTE views with a flip and never on other views.
 - **Empirical dealer sign**: open-close CSV parsing (flexible vendor column spellings), the
   customer⇒dealer sign inversion, and the supported/fails verdict in both directions.
+- **Token persistence**: writes are atomic (a failed write leaves the previous token intact), the
+  journal records rotation via fingerprints, and **raw refresh tokens never appear in the log**.
+- **Stale-client reload**: a token rotated by another process forces a rebuild before the next call —
+  the fix for tokens dying in hours instead of days.
 - Plus: quote-filter behavior (including **wing preservation**), OpEx calendar arithmetic, retry
-  classification (transient vs. auth), and cross-process token-lock exclusivity via a real subprocess.
+  classification (transient vs. auth), cross-process token-lock exclusivity via a real subprocess, and
+  lock re-entrancy (nested acquisition must not deadlock against itself).

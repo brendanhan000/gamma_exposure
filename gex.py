@@ -126,7 +126,7 @@ Setup (one time):
 Usage:
     python3 gex.py                 # 0DTE + all expiries, SPY (default)
     python3 gex.py --expiry 0dte
-    python3 gex.py --expiry 2026-06-19 --rate 0.043
+    python3 gex.py --expiry 2026-06-19 --rate 0.0469
     python3 gex.py --ticker QQQ    # any optionable ETF/equity with listed OI
     python3 gex.py --demo          # offline synthetic chain, no credentials
 
@@ -167,7 +167,7 @@ DEFAULT_TICKER       = "SPY"      # SPY, not SPX: Schwab returns ZERO open inter
                                   # OI-weighted -- SPX GEX is impossible on this
                                   # source. SPY is the standard dealer-gamma proxy.
 DEFAULT_MULTIPLIER   = 100        # standard equity/ETF & index option multiplier
-DEFAULT_RATE         = 0.043      # risk-free, ~3M T-bill ballpark; OVERRIDE with --rate
+DEFAULT_RATE         = 0.0469     # risk-free, ~3M T-bill ballpark; OVERRIDE with --rate
 DEFAULT_DIV_YIELD     = 0.0       # generic fallback; per-ticker map below applies when known
 DEFAULT_PRICE_RANGE   = 0.10      # +/-10% repricing window for the flip search (a deep
                                   # short-gamma day can push the flip well past +/-5%)
@@ -206,9 +206,11 @@ class Contract:
     strike: float
     expiry: date
     cp: str            # 'call' or 'put'
-    oi: float          # open interest (contracts)
+    oi: float          # open interest (contracts) -- PRIOR session close
     iv: float          # implied volatility (decimal, e.g. 0.12)
     T: float = 0.0     # time-to-expiry in years; filled in by enrich step
+    volume: float = 0.0  # TODAY's traded contracts (live, unlike OI)
+    size: float = None   # exposure weight actually used; set by apply_weighting()
 
 
 @dataclass
@@ -280,14 +282,124 @@ def compute_gamma_bsm(S, K, T, sigma, r=DEFAULT_RATE, q=0.0):
 
 
 # ===========================================================================
+# Two profiles: intraday (trading layer) vs structural (overview layer)
+# ===========================================================================
+# The same contract set answers two different questions, and conflating them is
+# a modeling error:
+#
+#   INTRADAY (trading layer) -- 0DTE through the front week, plus the next
+#     monthly OpEx. That is where essentially all real-time hedging pressure
+#     lives. Weighted by OI BLENDED WITH TODAY'S VOLUME, because prior-close OI
+#     is stale by mid-morning on 0DTE and systematically understates the gamma
+#     actually driving the tape. This is the single biggest intraday error
+#     source. The flip and nearest walls move as spot traverses strikes and as
+#     0DTE volume builds, so this profile must be recomputed on a fast cadence
+#     (see --watch); a level computed at 09:35 is not the level at 13:00.
+#
+#   STRUCTURAL (overview layer) -- every expiry in the window, weighted by OI
+#     ONLY. Volume is today's churn; OI is durable positioning. This profile
+#     barely moves day to day, and that is the point: it locates the multi-day
+#     walls and the regime flip (above it dealers are long gamma and suppress
+#     vol, below it they are short and amplify).
+#
+# Both use PER-STRIKE implied vol -- the surface is never collapsed to a single
+# vol point, which would smear the flip across expiries whose vols genuinely
+# differ (front-week vs monthly).
+FRONT_WEEK_DAYS = 5          # "front week" horizon for the intraday profile
+VOL_WEIGHT_0DTE = 1.0        # today's volume counts fully for 0DTE
+VOL_WEIGHT_FRONT = 0.5       # partially for the rest of the front week
+
+
+def contract_weight(c, weighting, today):
+    """Exposure weight for one contract: OI, or OI blended with today's volume.
+
+    'oi'    -> prior-session open interest. Durable positioning (structural).
+    'blend' -> oi + volume * w(DTE), where w = 1.0 for 0DTE, 0.5 out to the
+               front week, 0.0 beyond. Rationale: 0DTE positions open AND close
+               within the session, so prior-close OI describes contracts that
+               existed overnight, not what is being hedged now.
+
+    ASSUMPTION (stated, not hidden): traded volume includes closing as well as
+    opening trades, so the blend is an UPPER BOUND on fresh positioning. It is
+    deliberately biased toward over-counting near-dated activity rather than
+    under-counting it, because understating live 0DTE gamma is the larger error.
+    """
+    if weighting != "blend":
+        return float(c.oi)
+    dte = (c.expiry - today).days
+    if dte <= 0:
+        w = VOL_WEIGHT_0DTE
+    elif dte <= FRONT_WEEK_DAYS:
+        w = VOL_WEIGHT_FRONT
+    else:
+        w = 0.0
+    return float(c.oi) + float(c.volume or 0.0) * w
+
+
+def apply_weighting(contracts, weighting, today):
+    """Stamp c.size on every contract; all downstream math uses size, not oi."""
+    for c in contracts:
+        c.size = contract_weight(c, weighting, today)
+    return contracts
+
+
+def intraday_horizon(today):
+    """Last expiry the intraday profile includes: front week OR next monthly OpEx."""
+    return max(today + timedelta(days=FRONT_WEEK_DAYS), next_monthly_opex(today))
+
+
+def select_profile_contracts(contracts, profile, today):
+    """Filter the contract set for a profile and stamp the right exposure weight.
+
+    Returns a NEW list of copies so the two profiles never share mutated state.
+    """
+    import copy
+    if profile == "intraday":
+        horizon = intraday_horizon(today)
+        sel = [c for c in contracts if c.expiry <= horizon]
+        weighting = "blend"
+    else:                                   # structural
+        sel = list(contracts)
+        weighting = "oi"
+    return apply_weighting([copy.copy(c) for c in sel], weighting, today)
+
+
+def zero_dte_cliff(contracts, spot, cfg, today, now=None):
+    """How much of this profile evaporates at today's close, and when.
+
+    The intraday flip is only valid until the 0DTE contracts settle. After the
+    16:00 ET close the profile you were trading is gone -- this quantifies the
+    drop so it is never a surprise.
+    """
+    now = now_et() if now is None else now
+    zero = [c for c in contracts if c.expiry == today]
+    if not zero:
+        return None
+    total = gross_dollar_gamma(contracts, spot, cfg)
+    if total <= 0:
+        return None
+    secs = max(0.0, seconds_to_expiry(today, now))
+    return {
+        "share": gross_dollar_gamma(zero, spot, cfg) / total,
+        "seconds_left": secs,
+        "hhmm": "{}h {:02d}m".format(int(secs // 3600), int((secs % 3600) // 60)),
+        "n": len(zero),
+    }
+
+
+# ===========================================================================
 # Per-contract / per-strike GEX
 # ===========================================================================
 def _to_arrays(contracts, convention):
-    """Pack a contract list into parallel numpy arrays for vectorized math."""
+    """Pack a contract list into parallel numpy arrays for vectorized math.
+
+    The exposure weight is c.size when set by apply_weighting() (which may blend
+    today's volume into OI for the intraday profile), else plain open interest.
+    """
     K     = np.array([c.strike for c in contracts], dtype=float)
     T     = np.array([c.T for c in contracts], dtype=float)
     iv    = np.array([c.iv for c in contracts], dtype=float)
-    oi    = np.array([c.oi for c in contracts], dtype=float)
+    oi    = np.array([c.oi if c.size is None else c.size for c in contracts], dtype=float)
     iscall = np.array([c.cp == "call" for c in contracts], dtype=bool)
     sign  = np.where(iscall, convention.call_sign, convention.put_sign).astype(float)
     return K, T, iv, oi, sign, iscall
@@ -334,9 +446,9 @@ def gross_dollar_gamma(contracts, spot, cfg):
     """
     if not contracts:
         return 0.0
-    K, T, iv, oi, sign, iscall = _to_arrays(contracts, cfg.convention)
+    K, T, iv, size, sign, iscall = _to_arrays(contracts, cfg.convention)
     gamma = compute_gamma_bsm(spot, K, T, iv, cfg.rate, cfg.div_yield)
-    return float(np.sum(np.abs(gamma * oi * cfg.multiplier * (spot ** 2) * 0.01)))
+    return float(np.sum(np.abs(gamma * size * cfg.multiplier * (spot ** 2) * 0.01)))
 
 
 # ===========================================================================
@@ -645,6 +757,92 @@ def _token_mtime(path):
         return None
 
 
+# ---------------------------------------------------------------------------
+# Token forensics + atomic persistence
+# ---------------------------------------------------------------------------
+# Tokens have been dying within hours instead of the documented 7 days, with no
+# process visibly running. Rather than keep guessing, every token READ and WRITE
+# is journaled with the PID, the command line, and a FINGERPRINT of the refresh
+# token (sha256 prefix -- identifies rotation without storing any secret). When
+# the next failure happens, scripts/token_audit.py names the culprit instead of
+# leaving it to speculation.
+#
+# The write is also made ATOMIC (temp file + os.replace). schwab-py's default
+# writer opens the token path with mode 'w', which TRUNCATES before writing: a
+# crash, a kill, or two overlapping writers can leave a truncated or interleaved
+# token file, which Schwab then rejects. os.replace is atomic on POSIX, so a
+# reader always sees either the old token or the new one -- never a half-written
+# one. This closes a real failure mode, independent of the diagnostics.
+TOKEN_AUDIT_LOG = os.path.join("logs", "token_audit.log")
+
+
+def _token_fingerprint(tok):
+    """Short, non-reversible id for a refresh token, so rotation is visible."""
+    import hashlib
+    if isinstance(tok, dict):
+        tok = (tok.get("token") or tok).get("refresh_token") or ""
+    if not tok:
+        return "none"
+    return hashlib.sha256(tok.encode()).hexdigest()[:10]
+
+
+def token_audit(event, path, payload=None, note=""):
+    """Append one forensic line. Never raises -- diagnostics must not break runs."""
+    try:
+        os.makedirs(os.path.dirname(TOKEN_AUDIT_LOG) or ".", exist_ok=True)
+        try:
+            with open("/proc/self/cmdline") as f:      # Linux
+                cmd = f.read().replace("\0", " ").strip()
+        except Exception:
+            cmd = " ".join(os.path.basename(a) for a in sys.argv[:3])
+        exp = ""
+        if isinstance(payload, dict):
+            t = payload.get("token") or payload
+            if t.get("expires_at"):
+                exp = datetime.fromtimestamp(float(t["expires_at"])).strftime("%H:%M:%S")
+        with open(TOKEN_AUDIT_LOG, "a") as f:
+            f.write("{} pid={:<7} {:<6} rt={} acc_exp={:<9} {} [{}]\n".format(
+                now_et().strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), event,
+                _token_fingerprint(payload), exp or "-", note, cmd[:60]))
+    except Exception:
+        pass
+
+
+def _token_reader(path):
+    def read():
+        import json
+        with open(path) as f:
+            d = json.load(f)
+        token_audit("READ", path, d)
+        return d
+    return read
+
+
+def _token_writer(path):
+    def write(t, *args, **kwargs):
+        import json
+        import tempfile
+        token_audit("WRITE", path, t, note="rotated")
+        d = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".schwab_tok", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(t, f)
+                f.flush()
+                os.fsync(f.fileno())          # durable before the swap
+            os.replace(tmp, path)             # atomic on POSIX
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    return write
+
+
+_lock_depth = {"n": 0}          # re-entrancy guard (flock is per-fd, not per-process)
+
+
 @contextmanager
 def token_lock(token_path, timeout=120.0, poll=0.25):
     """Cross-process exclusive lock guarding Schwab API calls (refresh rotation).
@@ -652,13 +850,22 @@ def token_lock(token_path, timeout=120.0, poll=0.25):
     Uses a sidecar '<token>.lock' file so the token itself is never truncated.
     On timeout it proceeds UNLOCKED rather than failing the run: a possible race
     is better than a guaranteed outage.
+
+    RE-ENTRANT within a process: nesting (e.g. a session wrapper around a fetch
+    that also locks) would otherwise deadlock, because flock on a second file
+    descriptor blocks against our own held lock.
     """
-    if not token_path:
-        yield
+    if not token_path or _lock_depth["n"] > 0:
+        _lock_depth["n"] += 1
+        try:
+            yield
+        finally:
+            _lock_depth["n"] -= 1
         return
     lock_path = token_path + ".lock"
     fh = None
     locked = False
+    _lock_depth["n"] = 1
     try:
         fh = open(lock_path, "a+")
         deadline = time.time() + timeout
@@ -673,6 +880,7 @@ def token_lock(token_path, timeout=120.0, poll=0.25):
                 time.sleep(poll)
         yield
     finally:
+        _lock_depth["n"] = 0
         if fh is not None:
             if locked:
                 try:
@@ -713,12 +921,15 @@ def get_schwab_client(app_key, app_secret, token_path, callback=DEFAULT_CALLBACK
             "    python3 scripts/schwab_setup.py\n"
             "(refresh tokens expire after ~7 days, so re-run weekly).".format(token_path))
     try:
-        from schwab.auth import client_from_token_file
+        from schwab.auth import client_from_access_functions
     except ImportError as exc:
         raise RuntimeError(
             "schwab-py is required for live data: pip install 'schwab-py>=1.3' "
             "(needs Python >= 3.10).") from exc
-    client = client_from_token_file(token_path, app_key, app_secret)
+    # Equivalent to client_from_token_file, but with OUR read/write functions so
+    # every token touch is journaled and every write is atomic (see above).
+    client = client_from_access_functions(
+        app_key, app_secret, _token_reader(token_path), _token_writer(token_path))
     # Explicit HTTP timeout: without it a dying connection can hang for minutes
     # (observed ~8 min/ticker in scheduled runs). Guarded: older schwab-py only.
     try:
@@ -729,7 +940,34 @@ def get_schwab_client(app_key, app_secret, token_path, callback=DEFAULT_CALLBACK
     # (see schwab_client_stale) instead of presenting a superseded refresh token.
     client._gex_token_path = token_path
     client._gex_token_mtime = _token_mtime(token_path)
+    client._gex_app_key = app_key            # kept so the client can be REBUILT
+    client._gex_app_secret = app_secret      # from disk when the token rotates
     return client
+
+
+def reload_client_if_stale(client):
+    """Return a client built from the CURRENT on-disk token, rebuilding if needed.
+
+    MUST be called while holding token_lock, immediately before an API call.
+    Checking staleness earlier is a check-then-act race: between building a
+    client and acquiring the lock, another process can refresh and rotate the
+    refresh token, after which this client holds a SUPERSEDED token. Presenting
+    it makes Schwab revoke the entire token family -- observed live: a token
+    minted at 10:11 was dead by 11:29 with no process running in between.
+    """
+    path = getattr(client, "_gex_token_path", None)
+    if not path:
+        return client
+    if _token_mtime(path) == getattr(client, "_gex_token_mtime", None):
+        return client                        # unchanged on disk -> safe to use
+    key = getattr(client, "_gex_app_key", None)
+    sec = getattr(client, "_gex_app_secret", None)
+    if not (key and sec):
+        return client
+    try:
+        return get_schwab_client(key, sec, path)
+    except Exception:
+        return client                        # never break a run over a reload
 
 
 def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_count=None,
@@ -759,8 +997,10 @@ def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_coun
     for attempt in range(max_retries):
         try:
             # Serialized across processes: a refresh triggered inside this call
-            # rotates the shared refresh token (see token_lock).
+            # rotates the shared refresh token (see token_lock). The staleness
+            # re-check must happen INSIDE the lock -- see reload_client_if_stale.
             with token_lock(tok_path):
+                client = reload_client_if_stale(client)
                 resp = client.get_option_chain(symbol, **kwargs)
             resp.raise_for_status()
             return resp.json()
@@ -867,8 +1107,12 @@ def parse_schwab_chain(data):
                                 dropped["itm_bad_quote"] += 1
                                 continue
 
+                    try:
+                        vol = float(o.get("totalVolume") or 0.0)
+                    except (TypeError, ValueError):
+                        vol = 0.0
                     contracts.append(Contract(strike, exp_date, cp,
-                                              float(oi), ivf / 100.0))
+                                              float(oi), ivf / 100.0, volume=vol))
     return contracts, spot, ts_ns, dropped, status
 
 
@@ -961,6 +1205,7 @@ def fetch_spx_spy_ratio(client, base_ticker, spot):
     other = "SPY" if base_ticker == "SPX" else "$SPX"
     try:
         with token_lock(getattr(client, "_gex_token_path", None)):
+            client = reload_client_if_stale(client)
             resp = client.get_quote(other)
         resp.raise_for_status()
         q = ((resp.json().get(other) or {}).get("quote")) or {}
@@ -1480,6 +1725,13 @@ def parse_args(argv=None):
     p.add_argument("--token-path", default=None,
                    help="Schwab token file (default .schwab_token.json or $SCHWAB_TOKEN_PATH). "
                         "Create it with: python3 scripts/schwab_setup.py")
+    p.add_argument("--profiles", action="store_true",
+                   help="show the INTRADAY (front-week + next OpEx, OI blended with "
+                        "today's volume) and STRUCTURAL (all expiries, OI only) profiles.")
+    p.add_argument("--watch", type=int, default=0, metavar="SECONDS",
+                   help="re-fetch and re-print the intraday profile every N seconds "
+                        "(60 is a sensible cadence). Intraday the flip moves with spot "
+                        "and as 0DTE volume builds. Ctrl-C to stop.")
     p.add_argument("--levels-only", action="store_true",
                    help="print only a compact levels block (for notifications / quick pulls).")
     p.add_argument("--no-save-chain", action="store_true",
@@ -1594,6 +1846,84 @@ def print_gamma_buckets(contracts, spot, cfg, today):
     print()
 
 
+def print_profiles(all_contracts, spot, spy_ratio, cfg, today, now=None):
+    """Render the INTRADAY and STRUCTURAL profiles side by side.
+
+    Same contract set, two different questions -- see the section header above
+    select_profile_contracts() for why they must not be conflated.
+    """
+    now = now_et() if now is None else now
+    horizon = intraday_horizon(today)
+    specs = [
+        ("INTRADAY  (trading layer)", "intraday",
+         "0DTE .. {} (front week + next OpEx) | OI blended with today's volume"
+         .format(horizon.isoformat())),
+        ("STRUCTURAL  (overview layer)", "structural",
+         "all expiries in the fetched window | open interest only"),
+    ]
+    out = []
+    for title, key, desc in specs:
+        cs = select_profile_contracts(all_contracts, key, today)
+        view = compute_view(cs, spot, cfg) if cs else {"empty": True, "n": 0}
+        out.append((title, key, desc, cs, view))
+
+    print("=" * 78)
+    print("DUAL PROFILE   (same chain, two questions)")
+    print("=" * 78)
+    for title, key, desc, cs, view in out:
+        print("\n{}".format(title))
+        print("  scope: {}".format(desc))
+        if view.get("empty"):
+            print("  no usable contracts in this profile.")
+            continue
+        flip = view["flip_std"]["flip"]
+        w = view["walls"]
+        eq = cross_quote(cfg.ticker, flip, spy_ratio) if flip is not None else None
+        print("  contracts {:<6} net GEX {:>14}   gross {:>14}".format(
+            view["n"], fmt_bn(view["total"]), fmt_bn(view["gross"])))
+        print("  regime .... {}".format(regime_word(spot, flip)))
+        print("  flip ...... {}{}".format(
+            fmt_px(flip), "   ({} {})".format(eq[0], fmt_px(eq[1])) if eq else ""))
+        print("  call wall . {:<12} put wall . {}".format(
+            fmt_px(w["call_wall"]), fmt_px(w["put_wall"])))
+        if key == "intraday":
+            # Volume actually blended in -- shows how much of this profile is
+            # live flow that prior-close OI would have missed entirely.
+            oi_only = apply_weighting([c for c in cs], "oi", today)
+            base = gross_dollar_gamma(oi_only, spot, cfg)
+            cs2 = select_profile_contracts(all_contracts, "intraday", today)
+            blended = gross_dollar_gamma(cs2, spot, cfg)
+            if base > 0:
+                print("  volume uplift: {:+.1%} vs OI-only  (today's flow that "
+                      "stale OI misses)".format(blended / base - 1.0))
+            cliff = zero_dte_cliff(cs2, spot, cfg, today, now)
+            if cliff:
+                print("  *** 0DTE DECAY CLIFF: {:.0%} of this profile ({} contracts) "
+                      "expires".format(cliff["share"], cliff["n"]))
+                print("      at 16:00 ET -- {} left. These levels are valid only "
+                      "until then.".format(cliff["hhmm"]))
+
+    # Agreement check between the layers.
+    fi = out[0][4].get("flip_std", {}).get("flip") if not out[0][4].get("empty") else None
+    fs = out[1][4].get("flip_std", {}).get("flip") if not out[1][4].get("empty") else None
+    print()
+    if fi is not None and fs is not None:
+        gap = abs(fi - fs)
+        print("  layer agreement: intraday flip {:.2f} vs structural {:.2f} "
+              "({:.2f} apart = {:.2f}% of spot)".format(fi, fs, gap, gap / spot * 100))
+        if gap > 0.01 * spot:
+            print("  -> layers DISAGREE by >1% of spot: the near-dated book is "
+                  "pulling the flip away from")
+            print("     the standing structure. Trade the intraday level, but "
+                  "expect it to snap back toward")
+            print("     the structural one once the front-dated gamma expires.")
+        else:
+            print("  -> layers agree: the intraday flip is anchored by durable "
+                  "structure (higher confidence).")
+    print()
+    return out
+
+
 def select_views(all_contracts, expiry_arg, today):
     """Return list of (label, contracts) per the --expiry selection."""
     by_0dte = [c for c in all_contracts if c.expiry == today]
@@ -1637,6 +1967,8 @@ def run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
     views_raw = select_views(all_contracts, args.expiry, today)
     computed = [(lbl, compute_view(cs, spot, cfg)) for lbl, cs in views_raw]
 
+    if args.profiles:
+        print_profiles(all_contracts, spot, spy_ratio, cfg, today)
     if args.levels_only:
         for lbl, view in computed:
             render_levels_compact(lbl, view, spot, spy_ratio, cfg, today)
@@ -1801,6 +2133,45 @@ def main(argv=None):
         dropped_expired, floored, rate_is_default)
 
     print("runtime: {:.2f}s".format(time.time() - t_start))
+
+    # --watch: intraday the flip moves as spot traverses strikes and as 0DTE
+    # volume accumulates, so a level computed at the open is not the level at
+    # midday. Re-fetch on a fixed cadence and print only what changed.
+    if args.watch:
+        print("\nWatching {} every {}s (Ctrl-C to stop) ...".format(cfg.ticker, args.watch))
+        prev = None
+        try:
+            while True:
+                time.sleep(args.watch)
+                try:
+                    data = fetch_chain_schwab(client, symbol,
+                                              from_date=from_date, to_date=to_date)
+                    cs, sp, _ts, _dr, _st = parse_schwab_chain(data)
+                    if sp is None:
+                        continue
+                    kept, _de, _fl = enrich_and_filter_time(cs, now_et())
+                    intr = select_profile_contracts(kept, "intraday", today)
+                    if not intr:
+                        continue
+                    v = compute_view(intr, sp, cfg)
+                    flip, w = v["flip_std"]["flip"], v["walls"]
+                    ch = ""
+                    if prev:
+                        d_spot = sp - prev[0]
+                        d_flip = (flip - prev[1]) if (flip and prev[1]) else None
+                        ch = "  spot {:+.2f}{}".format(
+                            d_spot, "  flip {:+.2f}".format(d_flip) if d_flip is not None else "")
+                    print("{}  spot {:>9.2f}  flip {:>9}  walls {:>8}/{:<8} "
+                          "net {:>12}{}".format(
+                              now_et().strftime("%H:%M:%S"), sp, fmt_px(flip),
+                              fmt_px(w["call_wall"]), fmt_px(w["put_wall"]),
+                              fmt_bn(v["total"]), ch))
+                    prev = (sp, flip)
+                except Exception as e:
+                    print("{}  fetch failed: {}".format(
+                        now_et().strftime("%H:%M:%S"), str(e)[:70]))
+        except KeyboardInterrupt:
+            print("\nstopped.")
     return 0
 
 

@@ -465,6 +465,177 @@ def test_div_yield_per_ticker_map():
     assert build_config(parse_args(["--ticker", "QQQ", "--div-yield", "0.01"])).div_yield == 0.01
 
 
+def test_contract_weight_blends_volume_by_dte():
+    # Intraday: prior-close OI is stale for near-dated contracts, so today's
+    # volume is blended in -- fully for 0DTE, half out to the front week, not
+    # at all beyond. Structural weighting must ignore volume entirely.
+    import gex
+    today = date(2026, 8, 17)
+    mk = lambda exp, oi, vol: Contract(100.0, exp, "call", oi, 0.2, volume=vol)
+
+    zero = mk(today, 1000, 5000)                     # expires today
+    week = mk(today + timedelta(days=3), 1000, 5000)  # front week
+    far = mk(today + timedelta(days=40), 1000, 5000)  # beyond
+
+    # structural: OI only, regardless of volume or tenor
+    for c in (zero, week, far):
+        assert gex.contract_weight(c, "oi", today) == 1000
+
+    assert gex.contract_weight(zero, "blend", today) == 1000 + 5000 * 1.0
+    assert gex.contract_weight(week, "blend", today) == 1000 + 5000 * 0.5
+    assert gex.contract_weight(far, "blend", today) == 1000        # no volume credit
+
+    # An already-expired contract still counts as 0DTE-tier, not negative-tier.
+    past = mk(today - timedelta(days=1), 100, 200)
+    assert gex.contract_weight(past, "blend", today) == 100 + 200 * 1.0
+
+
+def test_profiles_differ_in_scope_and_weighting():
+    import gex
+    today = date(2026, 8, 17)                # Monday; next OpEx = Fri Aug 21
+    assert gex.next_monthly_opex(today) == date(2026, 8, 21)
+    assert gex.intraday_horizon(today) == date(2026, 8, 22)   # max(front week, OpEx)
+
+    near = Contract(100.0, today, "call", 10.0, 0.2, T=0.01, volume=90.0)
+    mid = Contract(100.0, date(2026, 8, 21), "put", 10.0, 0.2, T=0.02, volume=90.0)
+    far = Contract(100.0, date(2026, 12, 18), "call", 10.0, 0.2, T=0.4, volume=90.0)
+    allc = [near, mid, far]
+
+    intra = gex.select_profile_contracts(allc, "intraday", today)
+    struct = gex.select_profile_contracts(allc, "structural", today)
+
+    assert len(intra) == 2 and len(struct) == 3       # far excluded intraday
+    assert [c.size for c in intra] == [10 + 90, 10 + 90 * 0.5]
+    assert all(c.size == 10 for c in struct)          # OI only
+
+    # Profiles must not share mutated state with each other or the source list.
+    assert near.size is None
+    assert intra[0] is not struct[0]
+
+
+def test_zero_dte_cliff_quantifies_what_expires():
+    import gex
+    today = date(2026, 8, 17)
+    cfg = _cfg()
+    at_close = datetime(2026, 8, 17, 13, 0, tzinfo=gex._et_tz())   # 3h to 16:00
+    cs = [
+        Contract(100.0, today, "call", 1000.0, 0.2, T=0.001),      # expires today
+        Contract(100.0, date(2026, 9, 18), "call", 1000.0, 0.2, T=0.09),
+    ]
+    c = gex.zero_dte_cliff(cs, 100.0, cfg, today, now=at_close)
+    assert c is not None
+    assert c["n"] == 1
+    assert 0.0 < c["share"] < 1.0
+    assert c["hhmm"].startswith("3h")
+
+    # No 0DTE in the set -> nothing to warn about.
+    assert gex.zero_dte_cliff(cs[1:], 100.0, cfg, today, now=at_close) is None
+
+
+def test_token_write_is_atomic_and_journaled(tmp_path, monkeypatch):
+    # schwab-py's default writer opens the token with mode 'w', which TRUNCATES
+    # before writing: a crash or two overlapping writers can leave a corrupt
+    # token that Schwab rejects. Ours writes to a temp file and os.replace()s,
+    # so a reader sees either the old token or the new one -- never a partial.
+    import gex
+    import json
+
+    p = tmp_path / "tok.json"
+    p.write_text(json.dumps({"creation_timestamp": 1,
+                             "token": {"refresh_token": "RT_ONE", "expires_at": 111}}))
+    monkeypatch.setattr(gex, "TOKEN_AUDIT_LOG", str(tmp_path / "audit.log"))
+
+    read, write = gex._token_reader(str(p)), gex._token_writer(str(p))
+    before = read()
+    write({"creation_timestamp": 1, "token": {"refresh_token": "RT_TWO", "expires_at": 222}})
+    after = read()
+
+    assert after["token"]["refresh_token"] == "RT_TWO"
+    assert json.loads(p.read_text())                       # still valid JSON
+    assert not [f for f in os.listdir(str(tmp_path)) if f.startswith(".schwab_tok")]
+
+    # A failed write must not destroy the existing token (atomicity).
+    orig = p.read_text()
+    with pytest.raises(TypeError):
+        write({"bad": {1, 2, 3}})                          # sets are not JSON-serializable
+    assert p.read_text() == orig
+
+    # Journal records both touches, with rotation visible via fingerprints.
+    log = (tmp_path / "audit.log").read_text()
+    assert "READ" in log and "WRITE" in log
+    assert gex._token_fingerprint(before) != gex._token_fingerprint(after)
+    # Fingerprints must never leak the secret itself.
+    assert "RT_ONE" not in log and "RT_TWO" not in log
+
+
+def test_token_lock_is_reentrant_within_a_process(tmp_path):
+    # Nested acquisition must NOT deadlock: the fetch path locks, and a session
+    # wrapper may lock around it. flock is per-fd, so without re-entrancy the
+    # process would block against its own held lock until the 120s timeout.
+    import gex
+    tok = tmp_path / "t.json"
+    tok.write_text("{}")
+    reached = []
+    with gex.token_lock(str(tok), timeout=2.0):
+        with gex.token_lock(str(tok), timeout=2.0):
+            with gex.token_lock(str(tok), timeout=2.0):
+                reached.append(True)
+    assert reached == [True]
+    assert gex._lock_depth["n"] == 0                 # fully unwound
+
+    # Still exclusive to OTHER processes after nesting unwinds.
+    import subprocess, sys as _s
+    code = ("import fcntl\n"
+            "f=open(%r,'a+')\n"
+            "try:\n fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); print('ACQUIRED')\n"
+            "except OSError: print('BLOCKED')\n" % (str(tok) + ".lock"))
+    assert "ACQUIRED" in subprocess.run([_s.executable, "-c", code],
+                                        capture_output=True, text=True).stdout
+
+
+def test_reload_client_if_stale_rebuilds_on_rotation(tmp_path, monkeypatch):
+    # THE fix for tokens dying within hours: a client whose token file changed
+    # underneath it must be rebuilt before use, or it presents a superseded
+    # refresh token and Schwab revokes the whole family.
+    import gex
+    import time as _t
+
+    tok = tmp_path / "tok.json"
+    tok.write_text('{"token": {}}')
+
+    class _C:
+        pass
+
+    built = []
+
+    def fake_build(key, sec, path, callback=None):
+        c = _C()
+        c._gex_token_path = path
+        c._gex_token_mtime = gex._token_mtime(path)
+        c._gex_app_key, c._gex_app_secret = key, sec
+        built.append(c)
+        return c
+
+    monkeypatch.setattr(gex, "get_schwab_client", fake_build)
+    c1 = fake_build("K", "S", str(tok))
+
+    # Unchanged file -> same object, no needless rebuild.
+    assert gex.reload_client_if_stale(c1) is c1
+    assert len(built) == 1
+
+    # Token rotated by another process -> must hand back a REBUILT client.
+    _t.sleep(0.01)
+    os.utime(str(tok), (_t.time() + 5, _t.time() + 5))
+    c2 = gex.reload_client_if_stale(c1)
+    assert c2 is not c1 and len(built) == 2
+
+    # A client with no stamped credentials degrades safely instead of raising.
+    bare = _C()
+    bare._gex_token_path = str(tok)
+    bare._gex_token_mtime = None
+    assert gex.reload_client_if_stale(bare) is bare
+
+
 def test_chain_archive_persists_raw_rows(tmp_path):
     # The archive must keep what the GEX filters THROW AWAY: zero-OI strikes and
     # the -999 IV sentinel are the baseline tomorrow's dOI is measured against.

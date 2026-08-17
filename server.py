@@ -171,6 +171,94 @@ def health():
     return h
 
 
+# ---------------------------------------------------------------------------
+# Phone-based re-authentication (/setup)
+# ---------------------------------------------------------------------------
+# Schwab refresh tokens are hard-capped at 7 days with no programmatic renewal,
+# so re-login is permanent and weekly. These endpoints move that chore off the
+# terminal: approve on the phone, paste the redirect URL, done -- from anywhere.
+# The app secret never leaves the server; the browser only ever handles the
+# short-lived authorization code, exactly as in the CLI flow.
+_auth_ctx = {}                  # state -> AuthContext (pending logins)
+
+
+@app.get("/api/auth/start")
+def auth_start():
+    key = os.environ.get("SCHWAB_APP_KEY")
+    if not key:
+        raise HTTPException(status_code=500, detail={
+            "code": "no_credentials", "message": "SCHWAB_APP_KEY not set on the server."})
+    try:
+        from schwab.auth import get_auth_context
+    except ImportError:
+        raise HTTPException(status_code=500, detail={
+            "code": "no_schwab_py", "message": "schwab-py not installed on the server."})
+    callback = os.environ.get("SCHWAB_CALLBACK_URL", gex.DEFAULT_CALLBACK)
+    ctx = get_auth_context(key, callback)
+    _auth_ctx.clear()                       # only one pending login at a time
+    _auth_ctx[ctx.state] = ctx
+    return {"authorize_url": ctx.authorization_url, "state": ctx.state,
+            "callback": callback}
+
+
+@app.post("/api/auth/complete")
+async def auth_complete(payload: dict):
+    """Exchange the pasted redirect URL for a token and write it to disk."""
+    received = (payload or {}).get("redirect_url", "").strip()
+    if "code=" not in received:
+        raise HTTPException(status_code=422, detail={
+            "code": "bad_redirect",
+            "message": "That URL has no 'code=' in it. Copy the FULL address bar "
+                       "contents after approving."})
+    if not _auth_ctx:
+        raise HTTPException(status_code=409, detail={
+            "code": "no_pending_login",
+            "message": "No login in progress. Tap 'Start login' again."})
+    key = os.environ.get("SCHWAB_APP_KEY")
+    secret = os.environ.get("SCHWAB_APP_SECRET")
+    token_path = os.environ.get("SCHWAB_TOKEN_PATH", gex.DEFAULT_TOKEN_PATH)
+    ctx = list(_auth_ctx.values())[0]       # the context that minted this URL
+    try:
+        import schwab.auth as sa
+        writer = getattr(sa, "_" + "_make_update_token_func")(token_path)
+        # Serialize against any in-flight API call: a fresh login invalidates the
+        # old family, and a concurrent call presenting the OLD token would revoke
+        # the NEW one moments after it is created.
+        with gex.token_lock(token_path):
+            sa.client_from_received_url(key, secret, ctx, received, writer)
+    except Exception as e:
+        msg = str(e)
+        if "state" in msg.lower():
+            msg = ("State mismatch -- that redirect came from an older attempt. "
+                   "Tap 'Start login' and use only the newest link.")
+        raise HTTPException(status_code=400, detail={"code": "exchange_failed",
+                                                     "message": msg[:240]})
+    _auth_ctx.clear()
+
+    # Validate what was written: a token with no refresh_token dies in 30 min and
+    # can never renew -- catch it now, not at tomorrow's 07:45 run.
+    try:
+        import json as _json
+        with open(token_path) as f:
+            tok = (_json.load(f).get("token") or {})
+        if not tok.get("refresh_token"):
+            raise HTTPException(status_code=400, detail={
+                "code": "bad_token",
+                "message": "Login wrote a token with no refresh token. Try again."})
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    _drop_client()                          # force a rebuild from the new token
+    _note_auth(True)
+    _exp_cache.clear()
+    _gex_cache.clear()
+    h = _token_health()
+    return {"ok": True, "token_days_left": h.get("token_days_left"),
+            "message": "Token installed. Levels are live again."}
+
+
 @app.get("/api/expirations")
 def expirations(ticker: str = Query("SPY", max_length=8)):
     """Real listed expirations for the picker (small strikeCount=1 fetch, cached)."""

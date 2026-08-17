@@ -86,7 +86,7 @@
 
 <header>
   <h1>Γ GEX Levels</h1><span class="dot" id="dot"></span>
-  <span class="tok" id="tok"></span>
+  <a class="tok" id="tok" href="/setup.html" style="text-decoration:none"></a>
 </header>
 
 <div class="lbl">Underlying</div>
@@ -150,8 +150,15 @@ async function health(){
   try{
     const h = await jget('/api/health', 8000);
     $('dot').className = 'dot ' + (h.ok ? 'ok' : 'bad');
-    $('tok').textContent = h.auth_error === 'schwab_token_expired'
-      ? 'token expired' : (h.token_days_left != null ? 'token ' + h.token_days_left.toFixed(1) + 'd' : '');
+    const t = $('tok'), d = h.token_days_left;
+    // Tap the indicator to re-auth. Turns amber inside the last 1.5 days so the
+    // weekly re-login happens on your schedule, not as a morning outage.
+    if (h.auth_error === 'schwab_token_expired') {
+      t.textContent = 'token expired · fix →'; t.style.color = '#f85149';
+    } else if (d != null) {
+      t.textContent = 'token ' + d.toFixed(1) + 'd' + (d < 1.5 ? ' · renew →' : '');
+      t.style.color = d < 1.5 ? '#d29922' : '#8b949e';
+    } else { t.textContent = ''; }
   }catch(e){ $('dot').className = 'dot bad'; }
 }
 
@@ -181,7 +188,13 @@ async function fetchLevels(){
     const j = await jget(`/api/gex?ticker=${S.ticker}&expiry=${encodeURIComponent(S.expiry)}&fresh=1`, 120000);
     S.data = j; render(j);
   }catch(e){
-    $('err').textContent = (e.code === 'schwab_token_expired' ? '🔑 ' : '⚠️ ') + (e.message || 'Request failed');
+    // An expired token is fixable from the phone -- link straight to /setup
+    // instead of telling the user to find a laptop and a terminal.
+    $('err').innerHTML = (e.code === 'schwab_token_expired' ? '🔑 ' : '⚠️ ')
+      + (e.message || 'Request failed')
+      + (e.code === 'schwab_token_expired'
+         ? '<br><a href="/setup.html" style="color:#58a6ff;font-weight:700;'
+           + 'display:inline-block;margin-top:9px">Re-authenticate now →</a>' : '');
     $('err').style.display = 'block';
     $('stamp').textContent = '';
   }

@@ -50,6 +50,26 @@ def main(argv=None) -> int:
         print("ERROR: set SCHWAB_APP_KEY and SCHWAB_APP_SECRET first.", file=sys.stderr)
         return 2
 
+    # A fresh login mints a NEW token family and invalidates the old one. If any
+    # other process is still holding the OLD refresh token and uses it after this
+    # login, Schwab treats that as reuse and revokes the family you just created
+    # -- the tokens-die-within-hours failure. Warn before, not after.
+    try:
+        import subprocess
+        out = subprocess.run(["pgrep", "-fl", "server.py|gex.py"],
+                             capture_output=True, text=True).stdout.strip()
+        others = [l for l in out.splitlines() if "schwab_setup" not in l]
+        if others:
+            print("\n[warn] These processes may still hold the OLD token and can revoke")
+            print("       the new one moments after login. Stop them first:")
+            for l in others[:6]:
+                print("         " + l)
+            print("       e.g.  pkill -f 'server.py'\n")
+            if input("Continue anyway? [y/N] ").strip().lower() != "y":
+                return 2
+    except Exception:
+        pass
+
     try:
         if args.manual:
             from schwab.auth import client_from_manual_flow
