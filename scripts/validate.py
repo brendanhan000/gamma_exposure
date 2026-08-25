@@ -109,7 +109,10 @@ def levels_from_archive(path, cfg, now=None):
         "call_wall": view["walls"]["call_wall"],
         "put_wall": view["walls"]["put_wall"],
         "net_gex": view["total"],
-        "regime": gex.regime_word(spot, view["flip_std"]["flip"]),
+        # Sign of net GEX at spot decides the regime (correct on inverted chains);
+        # spot vs flip is only the fallback when the total is unavailable.
+        "regime": gex.regime_word(spot, view["flip_std"]["flip"],
+                                  view["flip_std"].get("total_at_spot")),
     }
 
 

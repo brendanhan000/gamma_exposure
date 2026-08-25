@@ -697,8 +697,14 @@ def _decayed_contracts(contracts, decay_seconds):
         if secs <= 0:
             continue                      # expires before the projection horizon
         secs = max(secs, T_FLOOR_SECONDS)
-        out.append(Contract(c.strike, c.expiry, c.cp, c.oi, c.iv,
-                            T=secs / (DAY_COUNT * 24.0 * 3600.0)))
+        d = Contract(c.strike, c.expiry, c.cp, c.oi, c.iv,
+                     T=secs / (DAY_COUNT * 24.0 * 3600.0))
+        # Carry the exposure weight through: without this the decayed flip is
+        # computed on raw OI while flip_now used the blended (OI+volume) weight,
+        # so the projected "migration" would partly reflect a weighting change
+        # rather than pure time decay.
+        d.size = c.size
+        out.append(d)
     return out
 
 
@@ -1477,13 +1483,33 @@ def explain_empty_view(label, today, now=None):
     return "no contracts with usable OI and IV in this slice"
 
 
-def regime_word(spot, flip):
+def regime_word(spot, flip, total_at_spot=None):
+    """Regime label. The sign of net GEX AT SPOT is the ground truth; the
+    spot-vs-flip comparison is only the fallback when that sign is unavailable.
+
+    Why not just spot vs flip: "spot above the flip = dealers long gamma" assumes
+    the TYPICAL chain orientation (call gamma above, put gamma below). When the
+    book is inverted -- heavy put gamma ABOVE spot, as in stressed markets -- the
+    curve crosses zero with the opposite slope and spot > flip is actually SHORT
+    gamma. Reading the sign of the total at spot is correct either way.
+    """
+    if total_at_spot is not None:
+        if total_at_spot > 0:
+            return "LONG gamma"
+        if total_at_spot < 0:
+            return "SHORT gamma"
+        return "NEUTRAL (net gamma ~0 at spot)"
     if flip is None:
         return "UNDETERMINED"
     return "LONG gamma" if spot > flip else "SHORT gamma"
 
 
 def interpretation_line(spot, flip, total):
+    """Narrative for the current regime. `total` is the signed net GEX AT SPOT
+    (flip_std['total_at_spot']), and its SIGN -- not the spot-vs-flip relation --
+    decides long vs short: on an inverted chain (put gamma above spot) the curve
+    crosses zero with the opposite slope and spot > flip is SHORT gamma.
+    """
     if flip is None:
         if total > 0:
             return ("No zero-gamma crossing in range and total GEX is POSITIVE: "
@@ -1492,17 +1518,17 @@ def interpretation_line(spot, flip, total):
         return ("No zero-gamma crossing in range and total GEX is NEGATIVE: "
                 "model says dealers are net short gamma throughout -> expect "
                 "vol-amplification / trend risk. (Flip likely sits above the search window.)")
-    if spot > flip:
-        dist = (spot - flip) / spot * 100.0
-        return ("Spot is {:.2f}% ABOVE the flip -> dealers net LONG gamma: they sell "
-                "rallies / buy dips, dampening vol. Bias: range-bound, fade extremes, "
-                "watch for a pin near the call wall. Losing the flip flips the regime."
-                ).format(dist)
-    dist = (flip - spot) / spot * 100.0
-    return ("Spot is {:.2f}% BELOW the flip -> dealers net SHORT gamma: they buy "
-            "rallies / sell dips, amplifying vol. Bias: momentum/trend, wider ranges; "
-            "a break of the put wall can accelerate lower. Reclaiming the flip calms it."
-            ).format(dist)
+    dist = abs(spot - flip) / spot * 100.0
+    side = "ABOVE" if spot > flip else "BELOW"
+    if total > 0:
+        return ("Net GEX at spot is POSITIVE (spot {:.2f}% {} the flip) -> dealers net "
+                "LONG gamma: they sell rallies / buy dips, dampening vol. Bias: "
+                "range-bound, fade extremes, watch for a pin near the call wall. "
+                "Losing the flip flips the regime.").format(dist, side)
+    return ("Net GEX at spot is NEGATIVE (spot {:.2f}% {} the flip) -> dealers net "
+            "SHORT gamma: they buy rallies / sell dips, amplifying vol. Bias: "
+            "momentum/trend, wider ranges; a break of the put wall can accelerate "
+            "lower. Reclaiming the flip calms it.").format(dist, side)
 
 
 # ===========================================================================
@@ -1745,7 +1771,8 @@ def render_summary(label, view, spot, spy_ratio, cfg, today):
         return
     flip = view["flip_std"]["flip"]
     walls = view["walls"]
-    reg = regime_word(spot, flip)
+    total_at_spot = view["flip_std"].get("total_at_spot")
+    reg = regime_word(spot, flip, total_at_spot)
     print("  Current spot ...... {} {:,.2f}".format(cfg.ticker, spot))
     print("  Regime ............ {}  (spot {} flip)".format(
         reg, ">" if (flip is not None and spot > flip) else "<" if flip is not None else "?"))
@@ -1760,7 +1787,7 @@ def render_summary(label, view, spot, spy_ratio, cfg, today):
     print("  Call wall ......... {} {}".format(cfg.ticker, fmt_px(walls["call_wall"])))
     print("  Put wall .......... {} {}".format(cfg.ticker, fmt_px(walls["put_wall"])))
     print("  Total net GEX ..... {}  ({})".format(fmt_bn(view["total"]), fmt_usd(view["total"])))
-    print("  Interpretation .... " + interpretation_line(spot, flip, view["total"]))
+    print("  Interpretation .... " + interpretation_line(spot, flip, total_at_spot))
     # 0DTE OI-staleness escalation: the 0DTE flip is built on end-of-prior-session
     # OI that EXCLUDES everything opened intraday today -- on a big 0DTE day that
     # is most of the gamma. Surface this at the headline level, not just in the
@@ -2256,7 +2283,8 @@ def print_profiles(all_contracts, spot, spy_ratio, cfg, today, now=None):
         eq = cross_quote(cfg.ticker, flip, spy_ratio) if flip is not None else None
         print("  contracts {:<6} net GEX {:>14}   gross {:>14}".format(
             view["n"], fmt_bn(view["total"]), fmt_bn(view["gross"])))
-        print("  regime .... {}".format(regime_word(spot, flip)))
+        print("  regime .... {}".format(
+            regime_word(spot, flip, view["flip_std"].get("total_at_spot"))))
         print("  flip ...... {}{}".format(
             fmt_px(flip), "   ({} {})".format(eq[0], fmt_px(eq[1])) if eq else ""))
         print("  call wall . {:<12} put wall . {}".format(
@@ -2323,7 +2351,8 @@ def render_levels_compact(label, view, spot, spy_ratio, cfg, today):
     flip = view["flip_std"]["flip"]
     walls = view["walls"]
     print("{} | {} | spot {} | OI {}".format(cfg.ticker, label, fmt_px(spot), oi_date))
-    print("  regime .... {}".format(regime_word(spot, flip)))
+    print("  regime .... {}".format(
+        regime_word(spot, flip, view["flip_std"].get("total_at_spot"))))
     if flip is not None:
         eq = cross_quote(cfg.ticker, flip, spy_ratio)
         extra = "  ({} {})".format(eq[0], fmt_px(eq[1])) if eq else ""

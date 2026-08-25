@@ -295,6 +295,13 @@ def report(ticker, flow_dir=FLOW_DIR, day=None, expiry=None, top=15, spot=None):
         v = by_cp.get(cp)
         if not v or v["vol"] == 0:
             continue
+        # A perfectly balanced tape carries no directional information -- calling
+        # it "dealers LONG/SHORT" would invent a verdict the data does not support.
+        if v["signed"] == 0:
+            verdict[cp] = 0.0
+            print("  {:<5} customers net FLAT    -> no directional read "
+                  "(signed flow is exactly 0)".format(cp))
+            continue
         # Customers net buying -> dealers net short that side -> sign -1.
         empirical = -1.0 if v["signed"] > 0 else +1.0
         verdict[cp] = empirical

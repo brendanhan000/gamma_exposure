@@ -311,6 +311,7 @@ def _view_json(label, view, spot, spy_ratio, cfg, today=None):
     else:
         low_conf = False
     eq = gex.cross_quote(cfg.ticker, flip, spy_ratio) if flip is not None else None
+    total_at_spot = view["flip_std"].get("total_at_spot")
 
     decay = view.get("flip_decay") or {}
     flip_close = decay.get("flip_close")
@@ -325,7 +326,7 @@ def _view_json(label, view, spot, spy_ratio, cfg, today=None):
         "n": view["n"],
         "total": view["total"],
         "gross": view["gross"],
-        "regime": gex.regime_word(spot, flip),
+        "regime": gex.regime_word(spot, flip, total_at_spot),
         "flip": flip,
         "flip_equiv": {"ticker": eq[0], "level": round(eq[1], 2)} if eq else None,
         "flip_close": round(flip_close, 2) if flip_close is not None else None,
@@ -336,7 +337,7 @@ def _view_json(label, view, spot, spy_ratio, cfg, today=None):
         "is_0dte": "0DTE" in label.upper(),
         "call_wall": walls["call_wall"], "call_wall_gex": walls["call_wall_gex"],
         "put_wall": walls["put_wall"], "put_wall_gex": walls["put_wall_gex"],
-        "interpretation": gex.interpretation_line(spot, flip, view["total"]),
+        "interpretation": gex.interpretation_line(spot, flip, total_at_spot),
         "profile": {
             "strikes": [round(float(k), 2) for k in strikes[m]],
             "net": [round(float(x)) for x in net[m]],

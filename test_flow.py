@@ -135,3 +135,23 @@ def test_dealer_sign_contradicted_when_customers_sell_puts(tmp_path, capsys):
 def test_report_handles_missing_session(tmp_path, capsys):
     assert flow.report("SPY", str(tmp_path), datetime.date(2026, 1, 2)) == 1
     assert "No flow recorded" in capsys.readouterr().out
+
+
+def test_balanced_session_is_inconclusive_not_a_contradiction(tmp_path, capsys):
+    # signed == 0 carries no directional information; reporting "dealers LONG"
+    # (the old else-branch) invented a verdict the data does not support.
+    day = datetime.date(2026, 8, 24)
+    p = flow.flow_path("SPY", day, str(tmp_path))
+    rows = [
+        {"expiry": "2026-08-24", "cp": "put", "strike": 765.0, "dvolume": 100,
+         "sign": 1, "signed": 100, "last": 2.10, "bid": 2.0, "ask": 2.10,
+         "mid": 2.05, "rule": "quote", "bid_size": 5, "ask_size": 5},
+        {"expiry": "2026-08-24", "cp": "put", "strike": 765.0, "dvolume": 100,
+         "sign": -1, "signed": -100, "last": 2.00, "bid": 2.0, "ask": 2.10,
+         "mid": 2.05, "rule": "quote", "bid_size": 5, "ask_size": 5},
+    ]
+    flow.append_rows(p, rows, "T0")
+    assert flow.report("SPY", str(tmp_path), day) == 0
+    out = capsys.readouterr().out
+    assert "no directional read" in out
+    assert "CONTRADICTS" not in out and "AGREES with" not in out

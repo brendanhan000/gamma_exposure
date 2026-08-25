@@ -123,6 +123,39 @@ def test_find_flip_closed_form_crossing():
     assert res["flip"] == pytest.approx(expected, abs=0.05)
 
 
+def test_regime_follows_net_gex_sign_not_spot_vs_flip():
+    # Regression: on an INVERTED chain (call wall below spot, put wall above --
+    # a stressed-market shape) the curve crosses zero with the opposite slope, so
+    # spot > flip is SHORT gamma, not long. The regime must come from the sign of
+    # net GEX at spot, never from the bare spot-vs-flip comparison.
+    import gex
+    contracts = [
+        Contract(90.0, date(2027, 1, 1), "call", 5000.0, 0.2, T=1.0),   # below spot
+        Contract(110.0, date(2027, 1, 1), "put", 5000.0, 0.2, T=1.0),   # above spot
+    ]
+    cfg = _cfg()
+    cfg.price_range = 0.10
+    res = find_flip_level(contracts, 100.0, CONV_STANDARD, cfg)
+    assert res["flip"] is not None
+    assert res["total_at_spot"] < 0                       # net SHORT gamma at spot
+    assert 100.0 > res["flip"]                            # ... yet spot is ABOVE the flip
+    # The old label said LONG here; the sign-driven label must say SHORT.
+    assert gex.regime_word(100.0, res["flip"], res["total_at_spot"]) == "SHORT gamma"
+    # Typical orientation still reads LONG above the flip.
+    typical = [
+        Contract(110.0, date(2027, 1, 1), "call", 5000.0, 0.2, T=1.0),
+        Contract(90.0, date(2027, 1, 1), "put", 5000.0, 0.2, T=1.0),
+    ]
+    res2 = find_flip_level(typical, 100.0, CONV_STANDARD, cfg)
+    assert res2["total_at_spot"] > 0
+    assert gex.regime_word(100.0, res2["flip"], res2["total_at_spot"]) == "LONG gamma"
+    # Fallback path (no total supplied) keeps the old spot-vs-flip behaviour.
+    assert gex.regime_word(100.0, 95.0) == "LONG gamma"
+    assert gex.regime_word(100.0, None) == "UNDETERMINED"
+    # interpretation_line must agree with the sign too.
+    assert "SHORT gamma" in gex.interpretation_line(100.0, res["flip"], res["total_at_spot"])
+
+
 def test_find_flip_no_crossing_when_all_gamma_positive():
     # Under the flipped put sign both contributions are positive -> total never
     # crosses zero -> flip is None (graceful, no crash). This is exactly the
@@ -223,6 +256,29 @@ def test_decayed_contracts_floor_tiny_T():
     out = _decayed_contracts(cs, 9 * 60.0)     # 9 minutes decay -> 1 minute left
     floor_T = gex.T_FLOOR_SECONDS / (365 * 24 * 3600)
     assert out[0].T == pytest.approx(floor_T, rel=1e-9)
+
+
+def test_decayed_contracts_preserve_blended_size():
+    # Regression: the decayed copies must keep the OI+volume blend (`size`), or
+    # flip_close is computed on raw OI while flip_now used the blend -- and the
+    # projected "migration" partly measures a weighting change, not time decay.
+    import gex
+    today = date(2026, 8, 24)
+    cs = [Contract(100.0, today, "call", 1000.0, 0.2, T=0.005, volume=9000.0)]
+    blended = gex.select_profile_contracts(cs, "intraday", today)
+    assert blended[0].size == pytest.approx(10000.0)
+    out = gex._decayed_contracts(blended, 3600.0)
+    assert len(out) == 1
+    assert out[0].size == pytest.approx(10000.0)     # blend carried through
+    # And the decayed flip uses the blend: the signed total at spot must scale
+    # with size, not with raw OI.
+    cfg = _0dte_cfg()
+    tot_blend = gex._total_net_gex_at(
+        100.0, *gex._to_arrays(out, gex.CONV_STANDARD)[:5], cfg)
+    raw = gex._decayed_contracts(cs, 3600.0)          # size=None -> raw OI
+    tot_raw = gex._total_net_gex_at(
+        100.0, *gex._to_arrays(raw, gex.CONV_STANDARD)[:5], cfg)
+    assert tot_blend == pytest.approx(tot_raw * 10.0, rel=1e-9)
 
 
 def test_flip_time_decay_reports_now_and_close():
