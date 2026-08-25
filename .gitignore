@@ -20,3 +20,7 @@ logs/
 # Schwab serves only the current snapshot, so a lost day is lost forever.
 # Git-ignored because it grows continuously — but BACK IT UP, don't delete it.
 chains/
+
+# Intraday signed-flow recordings (flow.py). Like chains/, these cannot be
+# backfilled -- a session not tracked is gone. Git-ignored for size; back up.
+flow/

@@ -113,6 +113,9 @@
   <div class="card wide"><div class="k">Spot</div><div class="v" id="spot"></div><div class="s" id="spotsub"></div></div>
   <div class="card fl"><div class="k">Gamma flip</div><div class="v" id="flip"></div><div class="s" id="flipsub"></div></div>
   <div class="card"><div class="k">Net GEX / 1%</div><div class="v" id="net"></div><div class="s" id="netsub"></div></div>
+  <div class="card wide" id="movecard" style="display:none">
+    <div class="k">Implied move &middot; ATM straddle</div>
+    <div class="v" id="move"></div><div class="s" id="movesub"></div></div>
   <div class="card cw"><div class="k">Call wall</div><div class="v" id="cw"></div><div class="s">resistance / pin</div></div>
   <div class="card pw"><div class="k">Put wall</div><div class="v" id="pw"></div><div class="s">support / accelerant</div></div>
 </div>
@@ -212,6 +215,7 @@ function render(j){
   if (!v || v.empty){
     $('banner').className = 'banner'; $('cards').style.display = 'none';
     $('chart').style.display = 'none'; $('bt').style.display = 'none';
+    $('movecard').style.display = 'none';
     $('foot').textContent = 'No levels — ' + ((v && v.reason) || 'no contracts with usable OI and IV')
       + '. Pick another expiry, or use "All expiries".';
     return;
@@ -234,6 +238,19 @@ function render(j){
   $('netsub').textContent = (v.total < 0 ? 'dealers short gamma' : 'dealers long gamma');
   $('cw').textContent = px(v.call_wall);
   $('pw').textContent = px(v.put_wall);
+
+  // Implied move from the ATM straddle. Show the 1-SD figure as the headline,
+  // because that is the one comparable to the VIX/16 rule of thumb; the
+  // breakeven (straddle/spot) is ~20% smaller and shown as the subtitle.
+  const im = j.implied_move;
+  if (im) {
+    $('movecard').style.display = 'block';
+    $('move').textContent = '\u00b1' + (im.sd_pct * 100).toFixed(2) + '%  ('
+      + '\u00b1' + im.sd_points.toFixed(2) + ')';
+    $('movesub').textContent = '1-SD, vs VIX/16 \u00b7 breakeven \u00b1'
+      + (im.pct * 100).toFixed(2) + '% \u00b7 ' + (im.is_0dte ? '0DTE' : im.expiry)
+      + ' straddle ' + im.straddle.toFixed(2) + ' @ ' + im.strike;
+  } else { $('movecard').style.display = 'none'; }
 
   drawChart(v, j.spot);
 

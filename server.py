@@ -449,6 +449,31 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
 
     buckets = gex.gamma_expiry_buckets(usable, spot, cfg, today) if usable else []
 
+    # ATM straddle implied move, priced off the 0DTE chain (or the nearest live
+    # expiry once today's has settled). Reported as BOTH the breakeven/expected
+    # absolute move and the 1-SD equivalent, since only the latter is comparable
+    # to the VIX/16 rule of thumb.
+    move = None
+    if usable:
+        exp_for_move = today if any(c.expiry == today for c in usable) else \
+            min(c.expiry for c in usable)
+        mv = gex.atm_straddle_move(usable, spot, expiry=exp_for_move)
+        if mv:
+            move = {
+                "expiry": mv["expiry"].isoformat(),
+                "is_0dte": mv["expiry"] == today,
+                "strike": mv["strike"],
+                "call_px": round(mv["call_px"], 2),
+                "put_px": round(mv["put_px"], 2),
+                "straddle": round(mv["straddle"], 2),
+                "pct": mv["pct"],                 # breakeven / expected |move|
+                "points": mv["straddle"],
+                "sd_pct": mv["sd_pct"],           # 1-SD (VIX/16-comparable)
+                "sd_points": mv["sd_points"],
+                "iv_atm": mv["iv_atm"],
+                "iv_sd_pct": mv["iv_sd_pct"],
+            }
+
     payload = {
         "ticker": t, "symbol": symbol, "spot": spot,
         "oi_date": gex.prior_trading_session(today).isoformat(),
@@ -457,7 +482,7 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
         "rate": cfg.rate, "div_yield": cfg.div_yield, "div_src": cfg.div_src,
         "convention": cfg.convention.label,
         "requested_expiry": exp, "all_days": all_days,
-        "views": views, "buckets": buckets,
+        "views": views, "buckets": buckets, "implied_move": move,
         "dropped": dropped, "dropped_expired": dropped_expired,
         "warnings": warnings, "runtime_s": round(time.time() - t0, 2),
         "cached": False,

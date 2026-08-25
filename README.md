@@ -197,6 +197,7 @@ python3 gex.py --demo                # offline synthetic chain
 **Flags:** `--ticker` · `--expiry` · `--all-days` (default 45; wider risks a vendor 502) · `--rate` ·
 `--div-yield` (auto per-ticker if omitted) · `--multiplier` · `--price-range` (±10% flip window) ·
 `--steps` · `--convention` / `--call-sign` / `--put-sign` · `--x-tick` (chart gridlines, default 10) ·
+`--no-save-chain` / `--chain-dir` (chain archive; archiving is ON by default) · `--callback` ·
 `--no-plot` · `--out-prefix` · `--levels-only` · `--profiles` · `--watch N` · `--token-path` · `--demo`. Full list: `python3 gex.py --help`.
 
 ### When to run what
@@ -401,9 +402,23 @@ and acts as a real pin — netting would hide it. Each wall measures its own sid
 
 | Output | Definition | Meaning |
 |---|---|---|
-| **Call wall** | Strike with the largest **call-side** dollar gamma | Resistance / pin |
-| **Put wall** | Strike with the largest **put-side** dollar gamma (absolute) | Support that becomes a downside **accelerant** if breached |
+| **Call wall** | Largest **call-side** gamma **at or above spot** | Resistance / pin |
+| **Put wall** | Largest **put-side** gamma **at or below spot** | Support that becomes a downside **accelerant** if breached |
 | **Regime** | `spot > flip` → LONG gamma<br>`spot < flip` → SHORT gamma | Long: vol-damping, mean-reverting.<br>Short: vol-amplifying, trend-prone. |
+
+**Second rule: each wall must sit on the side of spot where its label is true.** An unrestricted
+`argmax` can put "resistance" *below* spot, where it is not resistance at all. Observed live: QQQ
+spot 717.51 with the largest call-side **and** put-side gamma both at strike 700, so **both walls
+reported 700** — a breached magnet mislabelled as resistance. A dominant strike on the far side is
+still real information, so it is reported separately (`call_dominant` / `put_dominant`) rather than
+silently dropped:
+
+```
+Call wall (resistance/pin): QQQ 730.00   call-side GEX +0.671 $Bn
+Put wall  (support/accel):  QQQ 700.00   put-side GEX -1.055 $Bn
+  note: largest call-side gamma overall sits at 700.00
+        (below spot -- breached magnet, not resistance)
+```
 
 ---
 
@@ -426,6 +441,138 @@ and acts as a real pin — netting would hide it. Each wall measures its own sid
   noise. **Deep-OTM wings are never quote-filtered**: zero-bid wings still carry real tail gamma. Zero-OI
   strikes always dropped. All drop counts printed.
 - **Never crashes on a thin chain.** Degenerate inputs return 0, never NaN or infinity.
+- **Empty views explain themselves.** After 16:00 ET the day's 0DTE has settled, so the 0DTE view is
+  legitimately empty — it now says *why* (`today's 0DTE settled at 16:00 ET (7h 20m ago) — expired, not
+  missing`) instead of printing a bare `(empty)` that reads like a malfunction. Weekend, thin-chain and
+  already-settled-expiry cases each get their own wording.
+
+## Intraday signed order flow — measuring the dealer sign
+
+```bash
+gexflow --ticker SPY --interval 60     # track a session (run it during RTH)
+gexflow --ticker SPY --report          # analyse what was tracked
+```
+
+The dealer sign convention (`put_sign = -1`) is the model's **largest error source** —
+flip it and the gamma flip stops existing. `flow.py` measures it instead of assuming it.
+
+**Why polling is the whole point.** Measured live, one SPY strike traded **39,407 contracts**
+in a session while `lastSize` was **25**. A once-daily snapshot therefore classifies **0.06%**
+of the day's volume and guesses the rest. Polling turns that into hundreds of real
+observations:
+
+```
+window volume = totalVolume(t) - totalVolume(t-1)     # what actually TRADED
+direction     = Lee-Ready on (last, bid, ask)         # who was the AGGRESSOR
+signed flow   = window volume x direction             # accumulated per contract
+```
+
+**Lee-Ready classification** uses the quote rule (last above the mid → buyer-initiated,
+below → seller-initiated), falling back to the tick rule for at-mid prints. Unclassifiable
+trades contribute **zero**, never a guess.
+
+**From aggressor to dealer sign.** Market makers post liquidity, customers take it — so a
+buyer-initiated trade is customer-buys / dealer-sells:
+
+```
+put   customers net BUYING   -> dealers SHORT -> put_sign -1   [AGREES with the assumed -1]
+call  customers net SELLING  -> dealers LONG  -> call_sign +1  [AGREES with the assumed +1]
+
+-> The put_sign = -1 assumption is SUPPORTED by this session's flow.
+```
+
+When it **contradicts** the assumption, the report says so and tells you to re-run with
+`--put-sign +1` and compare the flip — which is precisely the mis-specification the
+LOW CONFIDENCE band has been measuring blind.
+
+> **Sampling, not a tape.** Offsetting trades between polls net out, and direction uses the
+> quote at each window's end. This infers **aggressor side, never counterparty identity** —
+> only CBOE open-close data tells you whether the taker was a customer or another dealer.
+> It replaces a pure guess with a measured estimate; it is not ground truth. Poll faster for
+> a finer estimate.
+
+Recordings land in `flow/<TICKER>/<date>.csv.gz` (git-ignored). Like `chains/`, a session
+**not tracked is gone** — this data cannot be backfilled.
+
+Flags: `--ticker` · `--interval` (seconds between polls) · `--report` · `--expiry` ·
+`--date` (analyse a past session) · `--top` (rows shown) · `--flow-dir` · `--all-days`.
+
+---
+
+## Hedging flow — where this gamma is actually executed
+
+Dealers hedging index gamma don't buy 500 single stocks; they trade **ES futures** (deepest book,
+cheapest execution, best margin), or SPY shares for smaller clips. So the flow these levels describe
+*is* futures flow — and index arbitrage carries it into SPX cash and SPY. Every run converts dollar
+gamma into the contracts that actually have to trade:
+
+```
+HEDGING FLOW  (where this gamma is actually EXECUTED)
+  Net GEX -7.415 $Bn per 1% move means, per 1% move, dealers must trade:
+
+  ES futures               19,378 contracts   (1.29% of a typical day)
+  SPY shares            9,711,805 shares      (12.95% of a typical day)
+
+  Direction: SELL into a drop / BUY into a rally (amplifying)
+```
+
+`contracts = GEX_dollars / (multiplier × index level)` — ES is $50/point, MES $5. ES tracks SPX to
+within the carry basis (<1%), immaterial for a flow estimate, which matters because **Schwab carries
+no futures data at all** (see below). The scope caveat still applies: computed from one underlying's
+chain, so it understates the full complex.
+
+---
+
+## Futures: not available from this data source
+
+**Verified live** — `/chains` returns **HTTP 400** for `/ES`, `/MES`, `/NQ`, and the quotes endpoint
+404s on `/MES` and `/ESZ26`. Worse, plain **`ES` silently resolves to EVERSOURCE ENERGY** (~$71), which
+would produce a confident, complete gamma profile for an unrelated utility stock. `CL` → Colgate, and so on.
+
+The tool now **refuses** slash-prefixed futures symbols and **warns loudly** on equity tickers that
+collide with futures roots, before any computation happens.
+
+> **The math would be fine if you had the data.** Futures options price under **Black-76**, and setting
+> `q = r` collapses the Merton form onto it *exactly* (verified to 1e-15): the `(r − q + σ²/2)` drift
+> becomes `σ²/2` and `exp(−q·T)` becomes `exp(−r·T)`. So
+> `gex.py --rate 0.0469 --div-yield 0.0469 --multiplier 50` would be correct for ES options — only the
+> data layer is missing. IBKR or CME DataMine would supply it.
+
+---
+
+## Implied move (ATM straddle)
+
+Every run prices the **at-the-money 0DTE straddle** and converts it to an expected move —
+the market's own quote on the session, and more precise than the `VIX/16` rule of thumb
+(a crude annual→daily scaling of a 30-day variance index, not a quote on today).
+
+```
+IMPLIED MOVE  (ATM straddle -- the market's own priced-in move)
+  basis ........... 0DTE | ATM strike 766 (+0.28 from spot 765.72)
+  ATM call     1.50  + ATM put     1.90  = straddle     3.40
+
+  Breakeven / expected |move|:  +/- 0.44%  (3.40 SPY pts)
+  1-SD equivalent ...........:  +/- 0.56%  (4.26 pts)   <-- compare to VIX/16
+  ATM IV cross-check ........:  +/- 0.35%   (IV 6.5% x sqrt(T))
+  In SPX terms ..............:  +/- 34 pts breakeven, +/- 43 pts 1-SD (level 7,674)
+```
+
+> ⚠️ **The two figures are different quantities — this is the part that gets misused.**
+> `straddle / spot` is the **breakeven**, which equals the *expected absolute move*
+> `E|ΔS|/S`. `VIX/16` estimates a **1-standard-deviation** move. They differ by
+> `√(π/2) ≈ 1.2533`, so comparing the straddle directly against VIX/16 **understates the
+> band by ~20%**. Both are printed; only the 1-SD line is VIX/16-comparable.
+
+Details: prices use the **mid** `(bid+ask)/2` rather than `last`, since a stale print badly
+distorts a 0DTE straddle; the ATM strike is the nearest strike quoting **both** sides. After
+16:00 ET the 0DTE contracts have settled, so it falls back to the nearest live expiry and
+says so. An **ATM IV cross-check** is printed alongside — when quote-implied and IV-implied
+vol disagree by more than ~25% a warning fires, which usually means a stale quote outside
+regular hours or a vendor day-count mismatch.
+
+Also exposed as `implied_move` in `/api/gex` and shown on the iPhone app.
+
+---
 
 ## Dual profile: trading layer vs structural layer
 
@@ -522,7 +669,7 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 | Path | Role |
 |---|---|
 | `gex.py` | Quant core + Schwab data layer + token persistence + rendering + CLI |
-| `test_gex.py` | 53 pytest cases (no network) |
+| `gex.py` core tests | `test_gex.py` — 63 pytest cases (no network) |
 | `server.py` | FastAPI JSON API, caching, client lifecycle, phone re-auth endpoints |
 | `static/index.html` | Installable iOS PWA (levels) |
 | `static/setup.html` | Phone-based Schwab re-authentication |
@@ -531,6 +678,7 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 | `scripts/token_audit.py` | Diagnoses early token expiry from the token journal |
 | `scripts/daily_gex.sh` | Multi-cadence notifier |
 | `scripts/*.plist` | 4 launchd agents (3 push cadences + API server) |
+| `test_flow.py` | 11 pytest cases for the flow tracker (no network) |
 | `chains/` | Chain archive — **not regenerable, back this up** (git-ignored) |
 | `logs/token_audit.log` | Token read/write journal (fingerprints only, no secrets) |
 | `GEX_Technical_Reference.pdf` | Full technical documentation |
@@ -538,7 +686,7 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 ## Tests
 
 ```bash
-python3 -m pytest test_gex.py -v      # 53 tests, no network
+python3 -m pytest test_gex.py test_flow.py -v    # 74 tests, no network
 ```
 
 Validation is against **independently derived truth**, not recorded output:

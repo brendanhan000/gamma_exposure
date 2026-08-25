@@ -465,6 +465,239 @@ def test_div_yield_per_ticker_map():
     assert build_config(parse_args(["--ticker", "QQQ", "--div-yield", "0.01"])).div_yield == 0.01
 
 
+def test_atm_straddle_implied_move_matches_theory():
+    # For an ATM straddle, BSM gives straddle ~= 0.7979 * S * sigma * sqrt(T)
+    # (= S * sigma * sqrt(T) * sqrt(2/pi), the EXPECTED ABSOLUTE move). So:
+    #   straddle/S      -> expected |move|      (breakeven)
+    #   straddle/S *1.2533 -> 1-SD move         (the VIX/16-comparable figure)
+    # Price a true ATM pair with BSM and assert the round trip recovers sigma.
+    import gex
+    S, K, T, sigma = 100.0, 100.0, 1.0 / 365.0, 0.16     # 1 day, 16% vol
+    c = gex.bs_price(S, K, T, sigma, cp="call")
+    p = gex.bs_price(S, K, T, sigma, cp="put")
+    cs = [
+        Contract(K, date(2026, 8, 20), "call", 100.0, sigma, T=T, bid=c - .01, ask=c + .01),
+        Contract(K, date(2026, 8, 20), "put", 100.0, sigma, T=T, bid=p - .01, ask=p + .01),
+    ]
+    m = gex.atm_straddle_move(cs, S)
+    assert m is not None and m["strike"] == K
+
+    expected_abs = sigma * math.sqrt(T) * math.sqrt(2.0 / math.pi)
+    assert m["pct"] == pytest.approx(expected_abs, rel=0.01)     # breakeven
+    assert m["sd_pct"] == pytest.approx(sigma * math.sqrt(T), rel=0.01)  # 1-SD
+
+    # The 1-SD figure must be the LARGER one; reporting the breakeven as 1-SD
+    # understates the band by ~20%.
+    assert m["sd_pct"] > m["pct"]
+    assert m["sd_pct"] / m["pct"] == pytest.approx(math.sqrt(math.pi / 2), rel=1e-9)
+
+    # Quote-implied and IV-implied agree when both come from the same inputs.
+    assert m["iv_sd_pct"] == pytest.approx(m["sd_pct"], rel=0.02)
+
+
+def test_is_rth_boundaries():
+    # The divergence warning branches on this, so the edges matter.
+    import gex
+    et = gex._et_tz()
+    mk = lambda d, h, m: datetime(2026, 8, d, h, m, tzinfo=et)
+    assert gex.is_rth(mk(24, 9, 30)) is True      # Monday open (inclusive)
+    assert gex.is_rth(mk(24, 15, 59)) is True
+    assert gex.is_rth(mk(24, 16, 0)) is False     # close (exclusive)
+    assert gex.is_rth(mk(24, 9, 29)) is False     # pre-open
+    assert gex.is_rth(mk(23, 12, 0)) is False     # Sunday
+    assert gex.is_rth(mk(22, 12, 0)) is False     # Saturday
+
+
+def test_implied_move_figures_are_independent_of_T():
+    # The frozen-quote/decaying-clock effect distorts the IV cross-check but NOT
+    # the move itself: breakeven and 1-SD are pure price ratios. Verified live on
+    # a Sunday where straddle vol read 10.4% vs a 6.5% vendor IV purely because T
+    # had decayed under a Friday-close price.
+    import gex
+    exp = date(2026, 8, 24)
+    def move_with_T(T):
+        cs = [Contract(766.0, exp, "call", 10.0, 0.065, T=T, bid=1.50, ask=1.51),
+              Contract(766.0, exp, "put", 10.0, 0.065, T=T, bid=1.89, ask=1.90)]
+        return gex.atm_straddle_move(cs, 765.72)
+
+    a = move_with_T(3.0 / 365)      # Friday's clock
+    b = move_with_T(1.04 / 365)     # Sunday's clock, same frozen quote
+    assert a["pct"] == pytest.approx(b["pct"])          # breakeven unchanged
+    assert a["sd_pct"] == pytest.approx(b["sd_pct"])    # 1-SD unchanged
+    # Only the IV-based cross-check moves with T.
+    assert b["iv_sd_pct"] < a["iv_sd_pct"]
+
+
+def test_atm_straddle_picks_nearest_strike_quoting_both_sides():
+    import gex
+    exp = date(2026, 8, 20)
+    # 105 is nearest spot 103 but has NO put quote -> must fall back to 100,
+    # the nearest strike quoting BOTH sides.
+    cs = [
+        Contract(105.0, exp, "call", 10.0, 0.2, T=0.01, bid=1.0, ask=1.2),
+        Contract(100.0, exp, "call", 10.0, 0.2, T=0.01, bid=3.0, ask=3.2),
+        Contract(100.0, exp, "put", 10.0, 0.2, T=0.01, bid=1.0, ask=1.2),
+    ]
+    m = gex.atm_straddle_move(cs, 103.0)
+    assert m["strike"] == 100.0
+    assert m["call_px"] == pytest.approx(3.1)      # mid, not last
+    assert m["put_px"] == pytest.approx(1.1)
+    assert m["straddle"] == pytest.approx(4.2)
+    assert m["pct"] == pytest.approx(4.2 / 103.0)
+
+    # Only the requested expiry is used.
+    other = date(2026, 9, 19)
+    cs2 = cs + [Contract(103.0, other, "call", 10.0, 0.2, T=0.1, bid=9.0, ask=9.2),
+                Contract(103.0, other, "put", 10.0, 0.2, T=0.1, bid=9.0, ask=9.2)]
+    assert gex.atm_straddle_move(cs2, 103.0, expiry=exp)["strike"] == 100.0
+    assert gex.atm_straddle_move(cs2, 103.0, expiry=other)["strike"] == 103.0
+
+
+def test_option_price_prefers_mid_and_degrades_safely():
+    import gex
+    exp = date(2026, 8, 20)
+    mk = lambda **kw: Contract(100.0, exp, "call", 1.0, 0.2, T=0.01, **kw)
+    # Mid is preferred over a stale last print.
+    assert gex.option_price(mk(bid=1.0, ask=2.0, last=99.0)) == pytest.approx(1.5)
+    # No quote -> fall back to last.
+    assert gex.option_price(mk(last=4.0)) == pytest.approx(4.0)
+    # Crossed / zero / absent -> None rather than a bogus price.
+    assert gex.option_price(mk(bid=2.0, ask=1.0)) is None
+    assert gex.option_price(mk(bid=0.0, ask=0.0)) is None
+    assert gex.option_price(mk()) is None
+    # No usable pair anywhere -> the whole calculation declines to guess.
+    assert gex.atm_straddle_move([mk()], 100.0) is None
+    assert gex.atm_straddle_move([], 100.0) is None
+
+
+def test_hedging_flow_converts_dollars_to_contracts():
+    # Dealers execute index gamma in ES futures, so dollar GEX becomes physical
+    # only once expressed in contracts: GEX / (multiplier * index level).
+    import gex
+    h = gex.hedging_flow(-5e9, 7650.0, "ES")
+    assert h["notional_per_unit"] == pytest.approx(50 * 7650.0)      # $382,500
+    assert h["contracts"] == pytest.approx(5e9 / (50 * 7650.0))      # ~13,072
+    assert h["pct_of_adv"] == pytest.approx(h["contracts"] / h["adv"])
+
+    # Micro ES is 1/10th the notional -> 10x the contract count.
+    m = gex.hedging_flow(-5e9, 7650.0, "MES")
+    assert m["contracts"] == pytest.approx(h["contracts"] * 10, rel=1e-9)
+
+    # SPY shares price off the ETF, not the index level.
+    s = gex.hedging_flow(-5e9, 765.0, "SPY")
+    assert s["contracts"] == pytest.approx(5e9 / 765.0)
+
+    # Magnitude only -- a long-gamma book trades just as much, in the other
+    # direction, so the sign belongs in `direction`, not the contract count.
+    assert gex.hedging_flow(+5e9, 7650.0, "ES")["contracts"] == pytest.approx(
+        h["contracts"])
+    assert "amplifying" in gex.hedging_flow(-5e9, 7650.0, "ES")["direction"]
+    assert "dampening" in gex.hedging_flow(+5e9, 7650.0, "ES")["direction"]
+
+    # Degenerate inputs decline rather than divide by zero.
+    assert gex.hedging_flow(1e9, 0.0, "ES") is None
+    assert gex.hedging_flow(1e9, 7650.0, "NOPE") is None
+    assert gex.hedging_flow(1e9, None, "ES") is None
+
+
+def test_futures_symbols_are_refused_or_flagged():
+    # Verified live: Schwab's /chains returns HTTP 400 for "/ES", and plain "ES"
+    # silently returns EVERSOURCE ENERGY (~$71) -- a confident gamma profile for
+    # entirely the wrong instrument. Both paths must be caught before compute.
+    import gex
+    lvl, msg = gex.check_futures_symbol("/ES")
+    assert lvl == "ERROR" and "does not serve futures options" in msg
+    assert gex.check_futures_symbol("/MES")[0] == "ERROR"
+
+    lvl, msg = gex.check_futures_symbol("ES")
+    assert lvl == "WARNING" and "EVERSOURCE" in msg
+    assert gex.check_futures_symbol("cl")[0] == "WARNING"      # case-insensitive
+
+    # Ordinary underlyings must pass through untouched.
+    for t in ("SPY", "QQQ", "IWM", "AAPL", "$SPX"):
+        assert gex.check_futures_symbol(t) is None
+
+
+def test_merton_gamma_reproduces_black76_when_q_equals_r():
+    # Futures options price under Black-76, not spot-Merton. Setting q = r makes
+    # the Merton form collapse exactly onto Black-76:
+    #   d1 drift (r - q + s^2/2) -> s^2/2, and the exp(-q*T) factor -> exp(-r*T).
+    # So the existing gamma function is already correct for futures options IF
+    # the caller passes --div-yield equal to --rate (and the right multiplier).
+    import gex
+    F, K, T, sig, r = 5900.0, 5900.0, 0.05, 0.15, 0.0469
+    vt = sig * math.sqrt(T)
+    d1 = (math.log(F / K) + 0.5 * sig * sig * T) / vt
+    black76 = (math.exp(-r * T) * math.exp(-d1 * d1 / 2) / math.sqrt(2 * math.pi)
+               / (F * vt))
+    assert float(gex.compute_gamma_bsm(F, K, T, sig, r=r, q=r)) == pytest.approx(
+        black76, rel=1e-12)
+    # The default q=0 is the SPOT model and is measurably different.
+    assert float(gex.compute_gamma_bsm(F, K, T, sig, r=r, q=0.0)) != pytest.approx(
+        black76, rel=1e-6)
+
+
+def test_walls_stay_on_the_correct_side_of_spot():
+    # A "call wall" below spot is not resistance, and a "put wall" above spot is
+    # not support. Observed live: QQQ spot 717.51 with the largest call-side AND
+    # largest put-side gamma both at strike 700, so BOTH walls reported 700.
+    import gex
+    cfg = _cfg()
+    exp = date(2027, 1, 1)
+    # Strike 100 carries the biggest gamma on BOTH sides, but sits BELOW spot.
+    contracts = [
+        Contract(100.0, exp, "call", 9000.0, 0.2, T=1.0),   # huge, but below spot
+        Contract(100.0, exp, "put", 9000.0, 0.2, T=1.0),    # huge, below spot
+        Contract(115.0, exp, "call", 3000.0, 0.2, T=1.0),   # above spot -> real resistance
+        Contract(95.0, exp, "put", 2000.0, 0.2, T=1.0),     # below spot -> real support
+    ]
+    spot = 110.0
+    profile = gex.compute_gex_profile(contracts, spot, CONV_STANDARD, cfg)
+
+    # Unrestricted (spot=None) reproduces the OLD behaviour: both land on 100.
+    old = gex.find_walls(profile)
+    assert old["call_wall"] == old["put_wall"] == 100.0
+
+    # Spot-aware: each wall must sit on the side where its label is true.
+    w = gex.find_walls(profile, spot)
+    assert w["call_wall"] >= spot, "call wall must be at or above spot"
+    assert w["put_wall"] <= spot, "put wall must be at or below spot"
+    assert w["call_wall"] == 115.0
+    assert w["put_wall"] == 100.0          # nearest/largest put gamma below spot
+    assert w["call_wall"] != w["put_wall"]
+
+    # The breached magnet is reported, not silently dropped.
+    assert w["call_dominant"] == 100.0     # bigger call gamma exists, but below spot
+    assert w["put_dominant"] is None       # put wall already IS the dominant put strike
+
+
+def test_walls_boundary_and_thin_chain():
+    # Spot exactly ON a strike: that strike is both nearest resistance and
+    # nearest support, so inclusive bounds legitimately allow both walls there.
+    import gex
+    cfg = _cfg()
+    exp = date(2027, 1, 1)
+    cs = [Contract(100.0, exp, "call", 1000.0, 0.2, T=1.0),
+          Contract(100.0, exp, "put", 1000.0, 0.2, T=1.0)]
+    p = gex.compute_gex_profile(cs, 100.0, CONV_STANDARD, cfg)
+    w = gex.find_walls(p, 100.0)
+    assert w["call_wall"] == w["put_wall"] == 100.0
+
+    # Every strike above spot: the put side has no strikes below, so it must
+    # fall back to the global extreme rather than invent or crash.
+    cs2 = [Contract(120.0, exp, "call", 1000.0, 0.2, T=1.0),
+           Contract(125.0, exp, "put", 1000.0, 0.2, T=1.0)]
+    p2 = gex.compute_gex_profile(cs2, 100.0, CONV_STANDARD, cfg)
+    w2 = gex.find_walls(p2, 100.0)
+    assert w2["put_wall"] == 125.0         # fallback, not None
+    assert w2["call_wall"] == 120.0
+
+    # Empty profile stays safe.
+    empty = gex.compute_gex_profile([], 100.0, CONV_STANDARD, cfg) if False else {
+        "strikes": np.array([]), "call_gex": np.array([]), "put_gex": np.array([])}
+    assert gex.find_walls(empty, 100.0)["call_wall"] is None
+
+
 def test_contract_weight_blends_volume_by_dte():
     # Intraday: prior-close OI is stale for near-dated contracts, so today's
     # volume is blended in -- fully for 0DTE, half out to the front week, not

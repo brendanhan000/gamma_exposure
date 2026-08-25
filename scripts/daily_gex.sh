@@ -68,43 +68,92 @@ fi
 RC_ALL=$N_FAIL
 
 # ---- notifiers (first configured one wins) ----
+# curl exits 0 on HTTP 4xx/5xx unless told otherwise, so a rejected push used to
+# be logged as a SUCCESS ("notified via ntfy") while nothing was delivered.
+# Every send now checks the actual status code and reports the failure.
+# send_text runs in a command substitution, so a shell variable set inside it
+# cannot reach the caller. The reason is written to a temp file instead, or the
+# failure would always be reported as "unknown".
+NOTIFY_ERR_FILE="$(mktemp -t gexnotify)"
+trap 'rm -f "$NOTIFY_ERR_FILE"' EXIT
+
+http_send() {   # description, curl args...  -> echoes "ok" on 2xx, else records why
+    local what="$1"; shift
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 45 "$@" 2>/dev/null)" || code="000"
+    if [ "${code:0:1}" = "2" ]; then
+        echo ok
+    else
+        # 000 = curl could not complete the request at all (DNS, TLS, timeout).
+        if [ "$code" = "000" ]; then
+            printf '%s unreachable (DNS/TLS/timeout)' "$what" >"$NOTIFY_ERR_FILE"
+        else
+            printf '%s HTTP %s' "$what" "$code" >"$NOTIFY_ERR_FILE"
+        fi
+        echo ""
+    fi
+}
+
+# HTTP header values must be ASCII; a non-ASCII title can be rejected or mangled.
+ascii() { printf '%s' "$1" | LC_ALL=C tr -cd '\11\12\40-\176'; }
+
 send_text() {  # title body
-    local title="$1" body="$2"
+    local title body
+    title="$(ascii "$1")"; body="$2"
     if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-        curl -s --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
-             --form-string "title=$title" --form-string "message=$body" \
-             https://api.pushover.net/1/messages.json >/dev/null && echo pushover
+        [ -n "$(http_send pushover --form-string "token=$PUSHOVER_TOKEN" \
+              --form-string "user=$PUSHOVER_USER" --form-string "title=$title" \
+              --form-string "message=$body" https://api.pushover.net/1/messages.json)" ] \
+            && echo pushover || echo FAILED
     elif [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-        curl -s -F "chat_id=$TELEGRAM_CHAT_ID" \
-             -F "text=$(printf '%s\n%s' "$title" "$body")" \
-             "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" >/dev/null && echo telegram
+        [ -n "$(http_send telegram -F "chat_id=$TELEGRAM_CHAT_ID" \
+              -F "text=$(printf '%s\n%s' "$title" "$body")" \
+              "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage")" ] \
+            && echo telegram || echo FAILED
     elif [ -n "${NTFY_TOPIC:-}" ]; then
-        curl -s -H "Title: $title" -d "$body" \
-             "${NTFY_SERVER:-https://ntfy.sh}/$NTFY_TOPIC" >/dev/null && echo ntfy
+        [ -n "$(http_send ntfy -H "Title: $title" -H "X-Priority: ${NTFY_PRIORITY:-default}" \
+              --data-binary "$body" "${NTFY_SERVER:-https://ntfy.sh}/$NTFY_TOPIC")" ] \
+            && echo ntfy || echo FAILED
     else
         echo none
     fi
 }
+
 send_image() {  # title imgpath
-    local title="$1" img="$2"
+    local title img
+    title="$(ascii "$1")"; img="$2"
     [ -f "$img" ] || return 0
     if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-        curl -s --form-string "token=$PUSHOVER_TOKEN" --form-string "user=$PUSHOVER_USER" \
-             --form-string "title=$title" --form-string "message=$(basename "$img" .png)" \
-             -F "attachment=@$img" https://api.pushover.net/1/messages.json >/dev/null
+        http_send pushover-img --form-string "token=$PUSHOVER_TOKEN" \
+            --form-string "user=$PUSHOVER_USER" --form-string "title=$title" \
+            --form-string "message=$(basename "$img" .png)" \
+            -F "attachment=@$img" https://api.pushover.net/1/messages.json >/dev/null
     elif [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-        curl -s -F "chat_id=$TELEGRAM_CHAT_ID" -F "photo=@$img" -F "caption=$title" \
-             "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendPhoto" >/dev/null
+        http_send telegram-img -F "chat_id=$TELEGRAM_CHAT_ID" -F "photo=@$img" \
+            -F "caption=$title" \
+            "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendPhoto" >/dev/null
     elif [ -n "${NTFY_TOPIC:-}" ]; then
-        curl -s -H "Title: $title" -H "Filename: $(basename "$img")" -T "$img" \
-             "${NTFY_SERVER:-https://ntfy.sh}/$NTFY_TOPIC" >/dev/null
+        http_send ntfy-img -H "Title: $title" -H "Filename: $(basename "$img")" \
+            -T "$img" "${NTFY_SERVER:-https://ntfy.sh}/$NTFY_TOPIC" >/dev/null
     fi
 }
 
+: >"$NOTIFY_ERR_FILE"
 USED="$(send_text "$TITLE" "$BODY")"
-if [ "$USED" != none ] && [ "${#CHARTS[@]}" -gt 0 ]; then
-    for ch in "${CHARTS[@]}"; do send_image "$TITLE — $(basename "$ch" .png)" "$ch"; done
+NOTIFY_ERR="$(cat "$NOTIFY_ERR_FILE" 2>/dev/null)"
+if [ "$USED" != none ] && [ "$USED" != FAILED ] && [ "${#CHARTS[@]}" -gt 0 ]; then
+    for ch in "${CHARTS[@]}"; do send_image "$TITLE - $(basename "$ch" .png)" "$ch"; done
 fi
-echo "[$(ts)] $TAG notified via $USED (rc=$RC_ALL, charts=${#CHARTS[@]}, title=\"$TITLE\")" >>"$LOG"
-[ "$USED" = none ] && echo "[$(ts)] WARNING: no notifier configured — set PUSHOVER_*/TELEGRAM_*/NTFY_* in .env" >>"$LOG"
+
+if [ "$USED" = none ]; then
+    echo "[$(ts)] WARNING: no notifier configured -- set PUSHOVER_*/TELEGRAM_*/NTFY_* in .env" >>"$LOG"
+elif [ "$USED" = FAILED ]; then
+    # Loud, because a silently-dropped push is indistinguishable from "no news".
+    echo "[$(ts)] *** NOTIFY FAILED (${NOTIFY_ERR:-unknown}) *** $TAG was NOT delivered." >>"$LOG"
+    echo "[$(ts)]     title was: \"$TITLE\"" >>"$LOG"
+    echo "NOTIFY FAILED: ${NOTIFY_ERR:-unknown} -- $TAG push was not delivered." >&2
+else
+    echo "[$(ts)] $TAG notified via $USED (rc=$RC_ALL, charts=${#CHARTS[@]}, title=\"$TITLE\")" >>"$LOG"
+    [ -n "$NOTIFY_ERR" ] && echo "[$(ts)]     note: chart upload issue ($NOTIFY_ERR)" >>"$LOG"
+fi
 exit 0

@@ -211,6 +211,9 @@ class Contract:
     T: float = 0.0     # time-to-expiry in years; filled in by enrich step
     volume: float = 0.0  # TODAY's traded contracts (live, unlike OI)
     size: float = None   # exposure weight actually used; set by apply_weighting()
+    bid: float = None    # live quote -- kept for straddle pricing
+    ask: float = None
+    last: float = None
 
 
 @dataclass
@@ -362,6 +365,106 @@ def select_profile_contracts(contracts, profile, today):
         sel = list(contracts)
         weighting = "oi"
     return apply_weighting([copy.copy(c) for c in sel], weighting, today)
+
+
+def is_rth(now=None):
+    """True during regular trading hours (Mon-Fri 09:30-16:00 ET)."""
+    now = now_et() if now is None else now
+    if now.weekday() >= 5:
+        return False
+    mins = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= mins < 16 * 60
+
+
+def option_price(c, prefer="mid"):
+    """Best available price for one contract: mid of the quote, else last.
+
+    Mid ((bid+ask)/2) is the standard mark for straddle pricing -- `last` can be
+    minutes stale on a quiet strike, and on 0DTE a stale print badly distorts the
+    implied move. Returns None when nothing usable exists.
+    """
+    b, a, l = c.bid, c.ask, c.last
+    if prefer == "mid" and b is not None and a is not None and a >= b and a > 0:
+        mid = 0.5 * (b + a)
+        if mid > 0:
+            return mid
+    if l is not None and l > 0:
+        return float(l)
+    if b is not None and a is not None and a >= b and a > 0:
+        return 0.5 * (b + a)
+    return None
+
+
+# Expected |move| of a lognormal at horizon T is sigma*sqrt(T)*sqrt(2/pi).
+# An ATM straddle costs ~0.7979 * S * sigma * sqrt(T), i.e. it prices the
+# EXPECTED ABSOLUTE move, not the 1-standard-deviation move. Dividing by this
+# constant converts one to the other.
+STRADDLE_TO_SD = math.sqrt(math.pi / 2.0)          # 1.2533
+
+
+def atm_straddle_move(contracts, spot, expiry=None, prefer="mid"):
+    """Implied move from the ATM straddle: (ATM call + ATM put) / spot.
+
+    This is the market's own priced-in move and is more precise than the VIX/16
+    rule of thumb, which is a crude annual->daily scaling (sqrt(252) ~ 15.87) of
+    a 30-day variance-swap index rather than a quote on the actual session.
+
+    WHAT THE NUMBER MEANS -- the distinction that matters:
+      * straddle / spot  = the BREAKEVEN move, and equals the EXPECTED ABSOLUTE
+        move E|dS|/S. This is what you pay to own the move.
+      * 1-SD move        = straddle/spot * sqrt(pi/2) ~ x1.2533. THIS is the
+        quantity VIX/16 estimates, so only this one is comparable to it.
+    Reporting the straddle as if it were 1-SD understates the band by ~20%.
+
+    The ATM strike is the listed strike nearest spot that has BOTH a call and a
+    put with a usable price. Returns None when the expiry has no usable pair.
+    """
+    if not contracts or not spot:
+        return None
+    sel = [c for c in contracts if expiry is None or c.expiry == expiry]
+    if not sel:
+        return None
+
+    # Index priced calls/puts by strike, then take the nearest strike quoting both.
+    calls, puts = {}, {}
+    for c in sel:
+        px = option_price(c, prefer)
+        if px is None:
+            continue
+        (calls if c.cp == "call" else puts)[c.strike] = (px, c)
+    both = sorted(set(calls) & set(puts), key=lambda k: abs(k - spot))
+    if not both:
+        return None
+
+    K = both[0]
+    call_px, call_c = calls[K]
+    put_px, put_c = puts[K]
+    straddle = call_px + put_px
+    pct = straddle / spot
+
+    # IV-implied 1-SD for the same horizon, as an independent cross-check.
+    iv_atm = 0.5 * ((call_c.iv or 0.0) + (put_c.iv or 0.0))
+    T = call_c.T or put_c.T or 0.0
+    iv_sd_pct = iv_atm * math.sqrt(T) if (iv_atm > 0 and T > 0) else None
+
+    return {
+        "strike": K,
+        "distance_from_spot": K - spot,
+        "call_px": call_px,
+        "put_px": put_px,
+        "straddle": straddle,
+        "expiry": call_c.expiry,
+        # Breakeven / expected absolute move.
+        "pct": pct,
+        "points": straddle,
+        # 1-SD equivalent -- the VIX/16-comparable figure.
+        "sd_pct": pct * STRADDLE_TO_SD,
+        "sd_points": straddle * STRADDLE_TO_SD,
+        "iv_atm": iv_atm,
+        "iv_sd_pct": iv_sd_pct,
+        "T": T,
+        "priced_from": prefer,
+    }
 
 
 def zero_dte_cliff(contracts, spot, cfg, today, now=None):
@@ -627,37 +730,67 @@ def flip_time_decay(contracts, spot, cfg, now):
             "seconds": secs_to_close}
 
 
-def find_walls(profile):
-    """Call wall = strike with the largest CALL-side gamma; put wall = strike
-    with the largest PUT-side gamma (in absolute terms).
+def find_walls(profile, spot=None):
+    """Call wall = largest CALL-side gamma AT OR ABOVE spot (resistance / pin).
+    Put wall  = largest PUT-side gamma AT OR BELOW spot (support / accelerant).
 
-    INDUSTRY CONVENTION: walls are computed PER-SIDE, not from net GEX. Net GEX
-    at a strike is (call_gex - put_gex) under the standard convention, so a
-    strike with huge call OI AND huge put OI nets to ~zero and would never be a
-    wall -- even though it carries enormous gross gamma and acts as a real pin.
-    Computing each wall from its own side measures the actual size of call
-    positioning (resistance/pin) and put positioning (support/accelerant)
-    independently, which is what the wall labels mean.
+    TWO rules, both load-bearing:
 
-    The signed convention still applies within each side: call GEX is positive
-    under the standard convention (dealers long calls), put GEX is negative
-    (dealers short puts). So the call wall is the strike of MAX call_gex and
-    the put wall is the strike of MIN (most negative) put_gex. The reported
-    *_gex values are the signed per-side contributions at those strikes.
+    (1) PER SIDE, not from net GEX. Net at a strike is (call_gex - put_gex), so a
+        strike with huge call OI AND huge put OI nets to ~zero and would never be
+        a wall -- even though it carries enormous gross gamma and acts as a real
+        pin. Each wall measures its own side's size.
+
+    (2) ON THE CORRECT SIDE OF SPOT. The labels assert direction: a call wall is
+        resistance, a put wall is support. An unrestricted argmax can put the
+        "resistance" BELOW spot, where it is not resistance at all -- observed
+        live: QQQ spot 717.51 with the largest call-side gamma at 700, which also
+        held the largest put-side gamma, so BOTH walls reported 700. Restricting
+        each side makes the reported level mean what its label says.
+
+    When the dominant strike overall sits on the far side of spot it is still
+    real information (a magnet that has already been breached), so it is reported
+    separately as 'call_dominant' / 'put_dominant' rather than silently dropped.
+
+    Sign convention within each side still applies: call GEX is positive under
+    the standard convention (dealers long calls), put GEX negative (short puts).
+    So the call wall is MAX call_gex and the put wall is MIN (most negative)
+    put_gex. Passing spot=None keeps the unrestricted behaviour.
     """
     strikes = profile["strikes"]
     call_gex = profile["call_gex"]
     put_gex = profile["put_gex"]
+    empty = {"call_wall": None, "call_wall_gex": None,
+             "put_wall": None, "put_wall_gex": None,
+             "call_dominant": None, "put_dominant": None}
     if strikes.size == 0:
-        return {"call_wall": None, "call_wall_gex": None,
-                "put_wall": None, "put_wall_gex": None}
-    i_call = int(np.argmax(call_gex))   # largest positive call-side gamma
-    i_put = int(np.argmin(put_gex))     # largest (most negative) put-side gamma
+        return empty
+
+    # Unrestricted extremes (what the strike structure says overall).
+    i_call_all = int(np.argmax(call_gex))
+    i_put_all = int(np.argmin(put_gex))
+
+    if spot is None:
+        i_call, i_put = i_call_all, i_put_all
+    else:
+        above = np.flatnonzero(strikes >= spot)
+        below = np.flatnonzero(strikes <= spot)
+        # Fall back to the unrestricted extreme if a side has no strikes at all
+        # (possible on a very thin chain); never invent a level.
+        i_call = int(above[np.argmax(call_gex[above])]) if above.size else i_call_all
+        i_put = int(below[np.argmin(put_gex[below])]) if below.size else i_put_all
+
     return {
         "call_wall": float(strikes[i_call]),
         "call_wall_gex": float(call_gex[i_call]),
         "put_wall": float(strikes[i_put]),
         "put_wall_gex": float(put_gex[i_put]),
+        # Dominant strike ignoring the spot restriction; None when it is the wall
+        # itself, so callers only see it when it adds information.
+        "call_dominant": (float(strikes[i_call_all])
+                          if i_call_all != i_call else None),
+        "put_dominant": (float(strikes[i_put_all])
+                         if i_put_all != i_put else None),
     }
 
 
@@ -722,6 +855,39 @@ def enrich_and_filter_time(contracts, now):
 SCHWAB_INDEX_SYMBOLS = {  # cash indices take a "$" prefix on Schwab
     "SPX": "$SPX", "NDX": "$NDX", "RUT": "$RUT", "VIX": "$VIX", "DJI": "$DJI",
 }
+
+
+# Futures roots that COLLIDE with unrelated equity tickers on this endpoint.
+# Verified live: --ticker ES returns EVERSOURCE ENERGY (~$71), not S&P futures,
+# and computes a confident, meaningless gamma profile from the wrong instrument.
+# A slash-prefixed futures symbol (/ES) is rejected outright by /chains with a
+# 400, so futures options are simply not available from this data source.
+FUTURES_ROOT_COLLISIONS = {
+    "ES": "S&P 500 futures (Schwab returns EVERSOURCE ENERGY equity)",
+    "NQ": "Nasdaq-100 futures", "RTY": "Russell 2000 futures",
+    "YM": "Dow futures", "CL": "Crude oil futures (returns COLGATE equity)",
+    "GC": "Gold futures", "ZB": "T-bond futures", "ZN": "10-year note futures",
+    "MES": "Micro S&P futures", "MNQ": "Micro Nasdaq futures",
+}
+
+
+def check_futures_symbol(ticker):
+    """Warn (or refuse) when a ticker looks like a futures request.
+
+    Returns an error string for slash-prefixed futures, a warning string for an
+    equity ticker that collides with a futures root, else None.
+    """
+    t = ticker.upper().strip()
+    if t.startswith("/"):
+        return ("ERROR", "{} is a FUTURES symbol. Schwab's /chains endpoint does not "
+                         "serve futures options (it returns HTTP 400), so futures GEX "
+                         "is not computable from this data source.".format(t))
+    if t in FUTURES_ROOT_COLLISIONS:
+        return ("WARNING", "'{}' is an EQUITY ticker here, not {}. Schwab has no "
+                           "futures options on this endpoint -- you will get a gamma "
+                           "profile for the wrong instrument.".format(
+                               t, FUTURES_ROOT_COLLISIONS[t]))
+    return None
 
 
 def to_schwab_symbol(ticker):
@@ -1111,8 +1277,13 @@ def parse_schwab_chain(data):
                         vol = float(o.get("totalVolume") or 0.0)
                     except (TypeError, ValueError):
                         vol = 0.0
+                    try:
+                        lastf = float(o["last"]) if o.get("last") is not None else None
+                    except (TypeError, ValueError):
+                        lastf = None
                     contracts.append(Contract(strike, exp_date, cp,
-                                              float(oi), ivf / 100.0, volume=vol))
+                                              float(oi), ivf / 100.0, volume=vol,
+                                              bid=bidf, ask=askf, last=lastf))
     return contracts, spot, ts_ns, dropped, status
 
 
@@ -1253,7 +1424,7 @@ def compute_view(contracts, spot, cfg, now=None):
         return {"empty": True, "n": 0}
     now = now_et() if now is None else now
     profile = compute_gex_profile(contracts, spot, cfg.convention, cfg)
-    walls = find_walls(profile)
+    walls = find_walls(profile, spot)
     flip_std = find_flip_level(contracts, spot, cfg.convention, cfg)
     # Spec-required literal check: flip the put sign (puts -> +). This makes every
     # contribution positive, so the flip typically VANISHES -- an honest sign that
@@ -1500,6 +1671,15 @@ def print_view_detail(label, view, spot, spy_ratio, cfg, today):
         cfg.ticker, fmt_px(walls["call_wall"]), fmt_bn(walls["call_wall_gex"])))
     print("  Put wall  [#4] (support/accel):  {} {}   put-side GEX {}".format(
         cfg.ticker, fmt_px(walls["put_wall"]), fmt_bn(walls["put_wall_gex"])))
+    # A dominant strike on the far side of spot is a magnet that has ALREADY been
+    # breached -- real information, but not resistance/support, so it is named
+    # separately rather than reported as the wall.
+    if walls.get("call_dominant") is not None:
+        print("    note: largest call-side gamma overall sits at {} (below spot -- "
+              "breached magnet, not resistance)".format(fmt_px(walls["call_dominant"])))
+    if walls.get("put_dominant") is not None:
+        print("    note: largest put-side gamma overall sits at {} (above spot -- "
+              "breached magnet, not support)".format(fmt_px(walls["put_dominant"])))
 
     # ---- Sensitivity / LOW CONFIDENCE (guardrail) ----
     # The dealer put-sign convention is the model's single biggest assumption, so
@@ -1666,6 +1846,25 @@ def plot_profile(label, view, spot, flip, walls, ticker, outpath,
 # ===========================================================================
 # Demo (offline) chain
 # ===========================================================================
+def _norm_cdf(x):
+    """Standard normal CDF via math.erf (stdlib; scipy is not a dependency)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_price(S, K, T, sigma, r=0.0, q=0.0, cp="call"):
+    """Black-Scholes-Merton option price. Used to give the offline demo chain
+    realistic quotes so the implied-move path is exercisable without network."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return max(0.0, (S - K) if cp == "call" else (K - S))
+    vt = sigma * math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / vt
+    d2 = d1 - vt
+    df_q, df_r = math.exp(-q * T), math.exp(-r * T)
+    if cp == "call":
+        return S * df_q * _norm_cdf(d1) - K * df_r * _norm_cdf(d2)
+    return K * df_r * _norm_cdf(-d2) - S * df_q * _norm_cdf(-d1)
+
+
 def make_demo_chain(spot, today, later):
     """Deterministic synthetic SPX-like chain for offline testing (NO network).
 
@@ -1682,8 +1881,15 @@ def make_demo_chain(spot, today, later):
         put_oi  = 2600.0 * math.exp(-(((K - spot * 0.97) / (spot * 0.02)) ** 2)) + 500.0
         for exp in (today, later):
             scale = 1.0 if exp == today else 0.7
-            contracts.append(Contract(float(K), exp, "call", round(call_oi * scale), iv))
-            contracts.append(Contract(float(K), exp, "put",  round(put_oi * scale), iv))
+            # Approximate T so the synthetic quotes are realistic; a 1-cent-wide
+            # market keeps mid == theoretical value.
+            dte = max((exp - today).days, 0)
+            T = max((dte + 0.25) / DAY_COUNT, 1.0 / DAY_COUNT / 24)
+            for cp, oi in (("call", call_oi), ("put", put_oi)):
+                px = bs_price(spot, float(K), T, iv, cp=cp)
+                contracts.append(Contract(
+                    float(K), exp, cp, round(oi * scale), iv,
+                    bid=max(0.0, px - 0.05), ask=px + 0.05, last=px))
     return contracts
 
 
@@ -1827,6 +2033,175 @@ def gamma_expiry_buckets(contracts, spot, cfg, today):
             "net": float(signed[m].sum()),
         })
     return out
+
+
+def print_implied_move(all_contracts, spot, cfg, today, spy_ratio=None):
+    """Render the ATM straddle implied move for the 0DTE (or nearest) expiry."""
+    exp = today
+    zero = [c for c in all_contracts if c.expiry == today]
+    label = "0DTE"
+    if not zero:
+        # After 16:00 ET today's contracts are settled and filtered out; fall back
+        # to the nearest live expiry rather than printing nothing, and say so.
+        future = sorted({c.expiry for c in all_contracts})
+        if not future:
+            return None
+        exp = future[0]
+        label = "nearest expiry {} ({}DTE)".format(exp.isoformat(), (exp - today).days)
+    m = atm_straddle_move(all_contracts, spot, expiry=exp)
+    if not m:
+        return None
+
+    print("-" * 78)
+    print("IMPLIED MOVE  (ATM straddle -- the market's own priced-in move)")
+    print("-" * 78)
+    print("  basis ........... {} | ATM strike {:g} ({:+.2f} from spot {:.2f})".format(
+        label, m["strike"], m["distance_from_spot"], spot))
+    print("  ATM call {:>8.2f}  + ATM put {:>8.2f}  = straddle {:>8.2f}".format(
+        m["call_px"], m["put_px"], m["straddle"]))
+    print()
+    print("  Breakeven / expected |move|:  +/- {:.2f}%  ({:.2f} {} pts)".format(
+        m["pct"] * 100.0, m["points"], cfg.ticker))
+    print("  1-SD equivalent ...........:  +/- {:.2f}%  ({:.2f} pts)   <-- compare to VIX/16".format(
+        m["sd_pct"] * 100.0, m["sd_points"]))
+    if m["iv_sd_pct"]:
+        print("  ATM IV cross-check ........:  +/- {:.2f}%   (IV {:.1f}% x sqrt(T))".format(
+            m["iv_sd_pct"] * 100.0, m["iv_atm"] * 100.0))
+        # The straddle and the vendor IV should imply the SAME 1-SD move. They
+        # diverge MECHANICALLY outside regular hours: the quote is frozen at the
+        # last close while T keeps counting down, and implied vol = move / sqrt(T)
+        # rises as the denominator shrinks. Verified live on a Sunday: straddle
+        # 3.40 on SPY 765.72 backed out 10.4% against a 1.04-day T, but 6.1%
+        # against Friday's 3.00-day T -- matching the vendor's 6.5%. Same price,
+        # same vendor IV, no stale quote (spread was 0.7% wide, mid == last).
+        ratio = m["sd_pct"] / m["iv_sd_pct"] if m["iv_sd_pct"] > 0 else None
+        if ratio and (ratio > 1.25 or ratio < 0.80):
+            straddle_vol = (m["sd_pct"] / math.sqrt(m["T"])) if m.get("T") else 0.0
+            print("    NOTE: quote-implied vol {:.1f}% vs vendor IV {:.1f}% "
+                  "({:.0f}% apart).".format(straddle_vol * 100.0,
+                                            m["iv_atm"] * 100.0, abs(ratio - 1) * 100.0))
+            if not is_rth():
+                print("    Expected outside regular hours: the quote is FROZEN at the last")
+                print("    close while T keeps decaying, so straddle vol drifts up on a")
+                print("    stale numerator. It resolves at the open.")
+                print("    The move figures above are price ratios and are NOT affected;")
+                print("    only this IV cross-check line is.")
+            else:
+                print("    During RTH this is a genuine data-quality flag: suspect a stale")
+                print("    or wide ATM quote, or a vendor IV on a different day-count.")
+                print("    Trust the straddle (a live two-sided market) over the IV field.")
+    # Express in SPX terms when running the SPY proxy, since the rule of thumb
+    # people compare against is quoted on the index.
+    eq = cross_quote(cfg.ticker, spot, spy_ratio) if spy_ratio else None
+    if eq:
+        print("  In {} terms ..............:  +/- {:.0f} pts breakeven, "
+              "+/- {:.0f} pts 1-SD (level {:,.0f})".format(
+                  eq[0], m["pct"] * eq[1], m["sd_pct"] * eq[1], eq[1]))
+    print()
+    print("  The straddle is what you PAY to own the move, so straddle/spot is the")
+    print("  breakeven (= expected absolute move). VIX/16 estimates a 1-STANDARD-")
+    print("  DEVIATION move, which is the larger figure above (x{:.4f}); comparing"
+          .format(STRADDLE_TO_SD))
+    print("  the breakeven directly to VIX/16 understates the band by ~20%.")
+    print()
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Hedging flow: translate dollar gamma into the venue where it is EXECUTED
+# ---------------------------------------------------------------------------
+# Dealers hedging index gamma do not buy 500 stocks -- they trade ES futures
+# (deepest book, cheapest execution, best margin), SPY shares for smaller clips.
+# So GEX expressed in dollars understates what it means operationally. Converting
+# to CONTRACTS makes the number physical: "a 1% move forces dealers to trade N ES
+# contracts", which can then be compared to what ES actually trades in a day.
+#
+#     contracts per 1% move = GEX_dollars / (multiplier * reference price)
+#
+# ES ~ SPX to within the carry basis (<1%), which is immaterial for a flow
+# estimate, so the index level is used directly rather than an ES quote -- this
+# data source carries no futures prices at all (verified: /ES returns EVERSOURCE
+# ENERGY on both the chains and quotes endpoints; /MES and /ESZ26 404).
+HEDGE_VENUES = {
+    # multiplier, label, typical daily volume for a sense of scale
+    "ES":  (50.0, "ES futures", 1_500_000),
+    "MES": (5.0, "Micro ES futures", 1_200_000),
+    "SPY": (1.0, "SPY shares", 75_000_000),
+}
+
+
+def hedging_flow(gex_dollars, index_level, venue="ES"):
+    """Contracts (or shares) dealers must trade per 1% move to stay hedged.
+
+    gex_dollars is signed dollar GEX per 1% move; index_level is the S&P level
+    (ES-equivalent) for futures venues, or the ETF price for SPY shares.
+    """
+    if venue not in HEDGE_VENUES or not index_level:
+        return None
+    mult, label, adv = HEDGE_VENUES[venue]
+    notional = mult * index_level
+    if notional <= 0:
+        return None
+    contracts = abs(gex_dollars) / notional
+    return {
+        "venue": venue, "label": label, "multiplier": mult,
+        "notional_per_unit": notional,
+        "contracts": contracts,
+        "adv": adv,
+        "pct_of_adv": contracts / adv if adv else None,
+        # Short gamma => dealers trade WITH the move (destabilizing); long gamma
+        # => against it (stabilizing). The direction is what matters for impact.
+        "direction": ("SELL into a drop / BUY into a rally (amplifying)"
+                      if gex_dollars < 0 else
+                      "BUY a drop / SELL a rally (dampening)"),
+    }
+
+
+def print_hedging_flow(view, spot, cfg, spy_ratio=None, venues=("ES", "SPY")):
+    """Show the dealer hedging requirement in the venue where it executes."""
+    if view.get("empty"):
+        return None
+    total = view["total"]
+    # Futures/index venues are priced off the S&P level; SPY shares off SPY.
+    base = cfg.ticker.upper().lstrip("$")
+    if base == "SPX":
+        index_level, spy_px = spot, (spot / spy_ratio if spy_ratio else None)
+    else:
+        eq = cross_quote(cfg.ticker, spot, spy_ratio) if spy_ratio else None
+        index_level = eq[1] if (eq and eq[0] == "SPX") else None
+        spy_px = spot if base == "SPY" else None
+
+    print("-" * 78)
+    print("HEDGING FLOW  (where this gamma is actually EXECUTED)")
+    print("-" * 78)
+    print("  Dealers hedge index gamma in ES futures, not in 500 single stocks.")
+    print("  Net GEX {} per 1% move means, per 1% move, dealers must trade:".format(
+        fmt_bn(total)))
+    print()
+    shown = False
+    for v in venues:
+        ref = spy_px if v == "SPY" else index_level
+        h = hedging_flow(total, ref, v)
+        if not h:
+            continue
+        shown = True
+        line = "  {:<18} {:>12,.0f} {}".format(
+            h["label"], h["contracts"], "shares" if v == "SPY" else "contracts")
+        if h["pct_of_adv"] is not None:
+            line += "   ({:.2f}% of a typical day)".format(h["pct_of_adv"] * 100)
+        print(line)
+    if not shown:
+        print("  (no S&P reference level for this ticker)")
+        print()
+        return None
+    print()
+    print("  Direction: {}".format(hedging_flow(total, index_level or spy_px,
+                                                "ES")["direction"]))
+    print("  This is the flow your levels describe -- it lands in ES, and index")
+    print("  arbitrage carries it into SPX cash and SPY. Scope caveat: computed")
+    print("  from ONE underlying's chain, so it understates the full complex.")
+    print()
+    return True
 
 
 def print_gamma_buckets(contracts, spot, cfg, today):
@@ -1983,6 +2358,14 @@ def run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
         all_cs = next((cs for lbl, cs in views_raw if lbl == "ALL EXPIRIES" and cs), None)
         if all_cs:
             print_gamma_buckets(all_cs, spot, cfg, today)
+        # Implied move from the ATM straddle -- priced off the same 0DTE chain.
+        print_implied_move(all_contracts, spot, cfg, today, spy_ratio)
+        # Translate the headline gamma into the venue where dealers execute it.
+        main_view = next((v for lbl, v in computed if lbl == "ALL EXPIRIES"), None)
+        if main_view is None and computed:
+            main_view = computed[0][1]
+        if main_view:
+            print_hedging_flow(main_view, spot, cfg, spy_ratio)
 
         for lbl, view in computed:
             print_view_detail(lbl, view, spot, spy_ratio, cfg, today)
@@ -2075,6 +2458,13 @@ def main(argv=None):
         from_date = to_date = date.fromisoformat(args.expiry)  # validated above
     else:  # default: both 0DTE and all -> fetch the full near-dated window
         from_date, to_date = today, today + timedelta(days=args.all_days)
+
+    warn = check_futures_symbol(cfg.ticker)
+    if warn and warn[0] == "ERROR":
+        print("ERROR: " + warn[1], file=sys.stderr)
+        return 2
+    if warn:
+        print("  *** WARNING: {}".format(warn[1]))
 
     symbol = to_schwab_symbol(cfg.ticker)
     print("Fetching Schwab option chain for {} ({} .. {}) ...".format(symbol, from_date, to_date))
