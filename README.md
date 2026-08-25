@@ -499,6 +499,53 @@ Flags: `--ticker` · `--interval` (seconds between polls) · `--report` · `--ex
 
 ---
 
+## Validation — does the model actually predict anything?
+
+```bash
+gexvalidate --ticker QQQ        # replay the archive, score against realized moves
+```
+
+Everything else improves the *estimate*. `scripts/validate.py` asks whether the estimate is
+**useful**, by replaying every archived chain, recomputing that day's levels, and scoring them
+against what price did next.
+
+**No look-ahead:** a snapshot taken any time on day D is known by D's close, so every level is
+graded on the **following** session. The most recent day always waits for tomorrow.
+
+### Test 1 — overnight vs RTH (the falsifiable one)
+
+Options hedging happens in regular hours: SPX/SPY are closed overnight while the underlying still
+gaps on news. So **overnight is a natural control group** — the mechanism is switched off, every
+other driver of volatility is still present.
+
+| Outcome | Meaning |
+|---|---|
+| Effect in **RTH but not overnight** | Consistent with hedging transmission |
+| Effect in **both, equally** | The regime is probably proxying general volatility, not dealer gamma |
+| Effect in **neither** | No measurable predictive content |
+
+This is the test that can embarrass the model, which is why it is worth running.
+
+```
+  |move| by window                 SHORT        LONG         t   verdict
+  OVERNIGHT (control)            0.720%      0.526%     +0.67   n too small for a verdict
+  RTH (mechanism live)           0.409%      0.600%     -1.09   n too small for a verdict
+  RTH range (high-low)           0.910%      1.094%     -0.81   n too small for a verdict
+```
+
+### Test 2 — do the levels hold?
+
+Wall containment (did the next session's high respect the call wall, the low the put wall) and flip
+attraction (did price close *toward* the flip, vs a 50% coin flip). Containment is reported
+**alongside the wall's distance**, because a wall 3% away that "holds" on a 0.5% day tells you nothing.
+
+> **Honest statistics.** Sample size is printed with every result and **no significance is claimed
+> below 20 sessions per group** — small samples get descriptives and an explicit "n too small",
+> never a p-value that would only be noise. With ~11 sessions archived, current output is
+> directional at best.
+
+---
+
 ## Hedging flow — where this gamma is actually executed
 
 Dealers hedging index gamma don't buy 500 single stocks; they trade **ES futures** (deepest book,
