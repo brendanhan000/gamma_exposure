@@ -105,9 +105,9 @@ def _get_client():
     """
     global _client
     with _lock:
-        if _client is not None and gex.schwab_client_stale(_client):
-            _client = None          # token file was rewritten -> discard
-        if _client is None:
+        if _client is not None:
+            _client = gex.reload_client_if_stale(_client)
+        else:
             _client = gex.get_schwab_client(
                 os.environ.get("SCHWAB_APP_KEY"), os.environ.get("SCHWAB_APP_SECRET"),
                 os.environ.get("SCHWAB_TOKEN_PATH", gex.DEFAULT_TOKEN_PATH))
@@ -301,16 +301,7 @@ def _view_json(label, view, spot, spy_ratio, cfg, today=None):
         return {"label": label, "empty": True, "n": 0, "reason": reason}
     flip = view["flip_std"]["flip"]
     walls = view["walls"]
-    band_vals = [x for x in view.get("flip_band", {}).values() if x is not None]
-    if flip is None:
-        low_conf = True
-    elif band_vals:
-        allv = band_vals + [flip]
-        low_conf = max(abs(max(allv) - flip), abs(min(allv) - flip)) \
-            > gex.MATERIAL_FLIP_MOVE * spot
-    else:
-        low_conf = False
-    eq = gex.cross_quote(cfg.ticker, flip, spy_ratio) if flip is not None else None
+    eq =gex.cross_quote(cfg.ticker, flip, spy_ratio) if flip is not None else None
     total_at_spot = view["flip_std"].get("total_at_spot")
 
     decay = view.get("flip_decay") or {}
@@ -333,7 +324,7 @@ def _view_json(label, view, spot, spy_ratio, cfg, today=None):
         "flip_close_move": round(flip_move, 2) if flip_move is not None else None,
         "crossings": [round(float(c), 2) for c in view["flip_std"]["crossings"]],
         "flip_flipped": view["flip_flipped"]["flip"],
-        "low_confidence": low_conf,
+        "low_confidence": view["low_confidence"],
         "is_0dte": "0DTE" in label.upper(),
         "call_wall": walls["call_wall"], "call_wall_gex": walls["call_wall_gex"],
         "put_wall": walls["put_wall"], "put_wall_gex": walls["put_wall_gex"],
@@ -375,23 +366,12 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
         payload["cache_age_s"] = round(time.time() - hit[0], 1)
         return payload
 
-    # Config mirrors gex.main(): explicit args win, else per-ticker q map.
     base = t.lstrip("$")
-    if div_yield is not None:
-        q, q_src = div_yield, "query param"
-    elif base in gex.TICKER_DIV_YIELDS:
-        q, q_src = gex.TICKER_DIV_YIELDS[base], "built-in map"
-    else:
-        q, q_src = 0.0, "default 0"
+    q, q_src = gex.div_yield_for(t, div_yield)
     cfg = gex.Config(ticker=t, rate=rate if rate is not None else gex.DEFAULT_RATE,
                      div_yield=q, div_src=q_src)
-
-    if exp == "0dte":
-        from_d = to_d = today
-    elif exp in ("all", "both"):
-        from_d, to_d = today, today + timedelta(days=all_days)
-    else:
-        from_d = to_d = date.fromisoformat(exp)
+    expiry_arg = None if exp == "both" else exp
+    from_d, to_d = gex.fetch_window(expiry_arg, today, all_days)
 
     symbol = gex.to_schwab_symbol(t)
     try:
@@ -434,19 +414,8 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
     if base in ("SPX", "SPY"):
         spy_ratio, _px, _src = gex.fetch_spx_spy_ratio(client, base, spot)
 
-    if exp == "both":
-        views_raw = [("0DTE", [c for c in usable if c.expiry == today]),
-                     ("ALL EXPIRIES", usable)]
-    elif exp == "0dte":
-        views_raw = [("0DTE", [c for c in usable if c.expiry == today])]
-    elif exp == "all":
-        views_raw = [("ALL EXPIRIES", usable)]
-    else:
-        views_raw = [("EXPIRY {}".format(exp), usable)]
-
-    views = []
-    for lbl, cs in views_raw:
-        views.append(_view_json(lbl, gex.compute_view(cs, spot, cfg), spot, spy_ratio, cfg, today))
+    views = [_view_json(lbl, gex.compute_view(cs, spot, cfg), spot, spy_ratio, cfg, today)
+             for lbl, cs in gex.select_views(usable, expiry_arg, today)]
 
     buckets = gex.gamma_expiry_buckets(usable, spot, cfg, today) if usable else []
 
@@ -460,20 +429,7 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
             min(c.expiry for c in usable)
         mv = gex.atm_straddle_move(usable, spot, expiry=exp_for_move)
         if mv:
-            move = {
-                "expiry": mv["expiry"].isoformat(),
-                "is_0dte": mv["expiry"] == today,
-                "strike": mv["strike"],
-                "call_px": round(mv["call_px"], 2),
-                "put_px": round(mv["put_px"], 2),
-                "straddle": round(mv["straddle"], 2),
-                "pct": mv["pct"],                 # breakeven / expected |move|
-                "points": mv["straddle"],
-                "sd_pct": mv["sd_pct"],           # 1-SD (VIX/16-comparable)
-                "sd_points": mv["sd_points"],
-                "iv_atm": mv["iv_atm"],
-                "iv_sd_pct": mv["iv_sd_pct"],
-            }
+            move = {**mv, "expiry": mv["expiry"].isoformat(), "is_0dte": mv["expiry"] == today}
 
     payload = {
         "ticker": t, "symbol": symbol, "spot": spot,

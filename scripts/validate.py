@@ -55,6 +55,7 @@ import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from statistics import NormalDist, fmean, variance
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import gex  # noqa: E402
@@ -96,7 +97,7 @@ def levels_from_archive(path, cfg, now=None):
     # Value T as of the snapshot's own session close, so a replayed day is
     # priced the way it was seen, not as of today.
     asof = datetime(snap_day.year, snap_day.month, snap_day.day, 9, 45,
-                    tzinfo=gex._et_tz())
+                    tzinfo=gex.ET)
     usable, _dropped, _floored = gex.enrich_and_filter_time(contracts, asof)
     if not usable:
         return None
@@ -174,28 +175,15 @@ def build_panel(levels, ohlc):
 # ---------------------------------------------------------------------------
 # Statistics (dependency-light; honest about small samples)
 # ---------------------------------------------------------------------------
-def _mean(xs):
-    return sum(xs) / len(xs) if xs else float("nan")
-
-
-def _var(xs):
-    if len(xs) < 2:
-        return float("nan")
-    m = _mean(xs)
-    return sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
-
-
 def welch_t(a, b):
     """Welch's t and a normal-approximation two-sided p. None if degenerate."""
     if len(a) < 2 or len(b) < 2:
         return None, None
-    va, vb = _var(a), _var(b)
-    se = math.sqrt(va / len(a) + vb / len(b))
-    if not se or not math.isfinite(se):
+    se = math.sqrt(variance(a) / len(a) + variance(b) / len(b))
+    if not se:
         return None, None
-    t = (_mean(a) - _mean(b)) / se
-    p = 2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(t) / math.sqrt(2.0))))
-    return t, p
+    t = (fmean(a) - fmean(b)) / se
+    return t, 2.0 * (1.0 - NormalDist().cdf(abs(t)))
 
 
 def _verdict(t, p, n_a, n_b, min_n):
@@ -235,18 +223,18 @@ def test_overnight_vs_rth(rows, min_n=MIN_N):
         a = [abs(r[key]) for r in short if r[key] is not None]
         b = [abs(r[key]) for r in long_ if r[key] is not None]
         t, p = welch_t(a, b)
-        out[key] = (_mean(a), _mean(b), t, p)
+        out[key] = (fmean(a), fmean(b), t, p)
         print("  {:<26}{:>11.3%}{:>12.3%}{:>10}   {}".format(
-            label, _mean(a), _mean(b),
+            label, fmean(a), fmean(b),
             "{:+.2f}".format(t) if t is not None else "-",
             _verdict(t, p, len(a), len(b), min_n)))
 
     a = [r["rth_range"] for r in short if r["rth_range"] is not None]
     b = [r["rth_range"] for r in long_ if r["rth_range"] is not None]
     t, p = welch_t(a, b)
-    out["rth_range"] = (_mean(a), _mean(b), t, p)
+    out["rth_range"] = (fmean(a), fmean(b), t, p)
     print("  {:<26}{:>11.3%}{:>12.3%}{:>10}   {}".format(
-        "RTH range (high-low)", _mean(a), _mean(b),
+        "RTH range (high-low)", fmean(a), fmean(b),
         "{:+.2f}".format(t) if t is not None else "-",
         _verdict(t, p, len(a), len(b), min_n)))
 
@@ -288,11 +276,11 @@ def test_levels(rows, min_n=MIN_N):
     if n_c:
         print("    call wall held : {:>3}/{:<3} ({:.0%})   mean distance at compute: {:.2%}".format(
             len(held_c), n_c, len(held_c) / n_c,
-            _mean([(r["call_wall"] - r["spot"]) / r["spot"] for r in rows if r["call_wall"]])))
+            fmean([(r["call_wall"] - r["spot"]) / r["spot"] for r in rows if r["call_wall"]])))
     if n_p:
         print("    put wall held  : {:>3}/{:<3} ({:.0%})   mean distance at compute: {:.2%}".format(
             len(held_p), n_p, len(held_p) / n_p,
-            _mean([(r["put_wall"] - r["spot"]) / r["spot"] for r in rows if r["put_wall"]])))
+            fmean([(r["put_wall"] - r["spot"]) / r["spot"] for r in rows if r["put_wall"]])))
     print("    NOTE: a far-away wall 'holds' trivially. Containment is only")
     print("    meaningful against the distance shown -- a wall 3% away that holds")
     print("    on a 0.5% day tells you nothing.")

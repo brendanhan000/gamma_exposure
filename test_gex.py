@@ -21,7 +21,7 @@ from gex import (
     Contract,
     Config,
     CONV_STANDARD,
-    CONV_FLIPPED,
+    DealerConvention,
     compute_gamma_bsm,
     find_flip_level,
     flip_time_decay,
@@ -39,6 +39,9 @@ from gex import (
     third_friday,
     next_monthly_opex,
 )
+
+
+CONV_FLIPPED = DealerConvention(1.0, 1.0, "flipped put sign")
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +101,7 @@ def _cfg():
     # r=q=0 so the closed-form crossing is clean; multiplier irrelevant to the zero.
     return Config(rate=0.0, div_yield=0.0, multiplier=100,
                   price_range=0.05, steps=2000,
-                  convention=CONV_STANDARD, flipped_convention=CONV_FLIPPED)
+                  convention=CONV_STANDARD)
 
 
 def test_find_flip_closed_form_crossing():
@@ -178,7 +181,7 @@ def test_flip_invariant_to_multiplier_and_oi_scaling():
     ]
     c1 = _cfg()
     c2 = Config(rate=0.0, div_yield=0.0, multiplier=1000, price_range=0.05, steps=2000,
-                convention=CONV_STANDARD, flipped_convention=CONV_FLIPPED)
+                convention=CONV_STANDARD)
     r1 = find_flip_level(contracts, 100.0, CONV_STANDARD, c1)["flip"]
     r2 = find_flip_level(contracts, 100.0, CONV_STANDARD, c2)["flip"]
     assert r1 == pytest.approx(r2, abs=1e-6)
@@ -188,7 +191,7 @@ def _0dte_cfg(steps=1000):
     # 0DTE-style config: tiny T makes gamma a near-step at the strike, which is
     # exactly the regime that exposed the phantom-crossing and grid-node bugs.
     return Config(rate=0.0, div_yield=0.0, multiplier=100, price_range=0.10,
-                  steps=steps, convention=CONV_STANDARD, flipped_convention=CONV_FLIPPED)
+                  steps=steps, convention=CONV_STANDARD)
 
 
 def _0dte_contracts():
@@ -223,7 +226,7 @@ def test_flip_total_at_spot_is_exact_not_nearest_grid():
 
 
 def test_flip_root_refined_to_machine_precision():
-    # Regression: the bracketed crossing is refined with Brent's method, so the
+    # Regression: the bracketed crossing is refined by bisection, so the
     # 1000-step flip matches a 200k-step (near-exact) search to ~1e-9 instead of
     # being limited by linear interpolation across a wide grid cell.
     contracts = _0dte_contracts()
@@ -287,7 +290,7 @@ def test_flip_time_decay_reports_now_and_close():
     # use a `now` within 4 hours of the 16:00 ET close (13:00 ET -> 3h left) to
     # leave survivors after the decay.
     import gex
-    et = gex._et_tz()
+    et = gex.ET
     now = datetime(2026, 8, 5, 13, 0, tzinfo=et)     # Wednesday 13:00 ET, 3h to close
     contracts = _0dte_contracts()
     res = flip_time_decay(contracts, 100.0, _0dte_cfg(), now)
@@ -300,7 +303,7 @@ def test_flip_time_decay_reports_now_and_close():
 def test_flip_time_decay_none_after_close():
     # After 16:00 ET the 0DTE has settled: no projection, seconds <= 0.
     import gex
-    et = gex._et_tz()
+    et = gex.ET
     now = datetime(2026, 8, 5, 17, 30, tzinfo=et)    # Wednesday 17:30 ET
     contracts = _0dte_contracts()
     res = flip_time_decay(contracts, 100.0, _0dte_cfg(), now)
@@ -316,7 +319,7 @@ def test_flip_time_decay_moves_toward_atm_for_0dte():
     # _0dte_contracts() carry T = 4h, so use 13:30 ET (2.5h to close) to leave
     # survivors after the decay.
     import gex
-    et = gex._et_tz()
+    et = gex.ET
     now = datetime(2026, 8, 5, 13, 30, tzinfo=et)    # 2.5h to the close
     contracts = _0dte_contracts()
     res = flip_time_decay(contracts, 100.0, _0dte_cfg(), now)
@@ -327,7 +330,7 @@ def test_flip_time_decay_moves_toward_atm_for_0dte():
 def test_compute_view_includes_flip_decay():
     # compute_view must surface the time-decay projection so renderers can show it.
     import gex
-    et = gex._et_tz()
+    et = gex.ET
     now = datetime(2026, 8, 5, 10, 0, tzinfo=et)
     view = compute_view(_0dte_contracts(), 100.0, _0dte_cfg(), now=now)
     assert not view["empty"]
@@ -554,7 +557,7 @@ def test_atm_straddle_implied_move_matches_theory():
 def test_is_rth_boundaries():
     # The divergence warning branches on this, so the edges matter.
     import gex
-    et = gex._et_tz()
+    et = gex.ET
     mk = lambda d, h, m: datetime(2026, 8, d, h, m, tzinfo=et)
     assert gex.is_rth(mk(24, 9, 30)) is True      # Monday open (inclusive)
     assert gex.is_rth(mk(24, 15, 59)) is True
@@ -634,10 +637,6 @@ def test_hedging_flow_converts_dollars_to_contracts():
     assert h["notional_per_unit"] == pytest.approx(50 * 7650.0)      # $382,500
     assert h["contracts"] == pytest.approx(5e9 / (50 * 7650.0))      # ~13,072
     assert h["pct_of_adv"] == pytest.approx(h["contracts"] / h["adv"])
-
-    # Micro ES is 1/10th the notional -> 10x the contract count.
-    m = gex.hedging_flow(-5e9, 7650.0, "MES")
-    assert m["contracts"] == pytest.approx(h["contracts"] * 10, rel=1e-9)
 
     # SPY shares price off the ETF, not the index level.
     s = gex.hedging_flow(-5e9, 765.0, "SPY")
@@ -806,7 +805,7 @@ def test_zero_dte_cliff_quantifies_what_expires():
     import gex
     today = date(2026, 8, 17)
     cfg = _cfg()
-    at_close = datetime(2026, 8, 17, 13, 0, tzinfo=gex._et_tz())   # 3h to 16:00
+    at_close = datetime(2026, 8, 17, 13, 0, tzinfo=gex.ET)   # 3h to 16:00
     cs = [
         Contract(100.0, today, "call", 1000.0, 0.2, T=0.001),      # expires today
         Contract(100.0, date(2026, 9, 18), "call", 1000.0, 0.2, T=0.09),
@@ -857,31 +856,6 @@ def test_token_write_is_atomic_and_journaled(tmp_path, monkeypatch):
     assert "RT_ONE" not in log and "RT_TWO" not in log
 
 
-def test_token_lock_is_reentrant_within_a_process(tmp_path):
-    # Nested acquisition must NOT deadlock: the fetch path locks, and a session
-    # wrapper may lock around it. flock is per-fd, so without re-entrancy the
-    # process would block against its own held lock until the 120s timeout.
-    import gex
-    tok = tmp_path / "t.json"
-    tok.write_text("{}")
-    reached = []
-    with gex.token_lock(str(tok), timeout=2.0):
-        with gex.token_lock(str(tok), timeout=2.0):
-            with gex.token_lock(str(tok), timeout=2.0):
-                reached.append(True)
-    assert reached == [True]
-    assert gex._lock_depth["n"] == 0                 # fully unwound
-
-    # Still exclusive to OTHER processes after nesting unwinds.
-    import subprocess, sys as _s
-    code = ("import fcntl\n"
-            "f=open(%r,'a+')\n"
-            "try:\n fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); print('ACQUIRED')\n"
-            "except OSError: print('BLOCKED')\n" % (str(tok) + ".lock"))
-    assert "ACQUIRED" in subprocess.run([_s.executable, "-c", code],
-                                        capture_output=True, text=True).stdout
-
-
 def test_reload_client_if_stale_rebuilds_on_rotation(tmp_path, monkeypatch):
     # THE fix for tokens dying within hours: a client whose token file changed
     # underneath it must be rebuilt before use, or it presents a superseded
@@ -897,7 +871,7 @@ def test_reload_client_if_stale_rebuilds_on_rotation(tmp_path, monkeypatch):
 
     built = []
 
-    def fake_build(key, sec, path, callback=None):
+    def fake_build(key, sec, path):
         c = _C()
         c._gex_token_path = path
         c._gex_token_mtime = gex._token_mtime(path)
@@ -964,7 +938,7 @@ def test_explain_empty_view_distinguishes_expired_from_missing():
     import gex
     from datetime import datetime
 
-    et = gex._et_tz()
+    et = gex.ET
     wed = date(2026, 8, 5)                       # a Wednesday
 
     after_close = datetime(2026, 8, 5, 23, 18, tzinfo=et)
@@ -998,7 +972,7 @@ def test_render_summary_escalates_0dte_staleness(capsys):
     # Fix #3: a 0DTE view WITH a flip must carry the prominent staleness caveat
     # next to the headline number; a non-0DTE view must NOT.
     import gex
-    et = gex._et_tz()
+    et = gex.ET
     now = datetime(2026, 8, 5, 10, 0, tzinfo=et)     # mid-session Wednesday
     today = now.date()
     cfg = _0dte_cfg()
@@ -1126,30 +1100,6 @@ def test_token_lock_timeout_proceeds_unlocked(tmp_path):
     assert ran == [True]
 
 
-def test_schwab_client_stale_detects_rewritten_token(tmp_path):
-    # A long-lived holder must notice the token file was replaced by a re-login.
-    import gex
-    import time
-
-    tok = tmp_path / "tok.json"
-    tok.write_text('{"token": {}}')
-
-    class _C:
-        pass
-
-    c = _C()
-    c._gex_token_path = str(tok)
-    c._gex_token_mtime = gex._token_mtime(str(tok))
-    assert gex.schwab_client_stale(c) is False
-
-    time.sleep(0.01)
-    os.utime(str(tok), (time.time() + 5, time.time() + 5))   # simulate re-login
-    assert gex.schwab_client_stale(c) is True
-
-    # A client with no stamped path (not built by get_schwab_client) is inert.
-    assert gex.schwab_client_stale(_C()) is False
-
-
 def test_get_schwab_client_errors_without_creds_or_token(tmp_path):
     # get_schwab_client raises a clear RuntimeError BEFORE importing schwab-py,
     # so these checks pass on Python 3.9 (where schwab-py can't be installed).
@@ -1177,7 +1127,7 @@ def test_schwab_setup_script_importable():
 
 
 # ---------------------------------------------------------------------------
-# scripts/oi_history.py -- dOI opening-ratio grading + CBOE open-close ingestion
+# scripts/oi_history.py -- dOI opening-ratio grading
 # ---------------------------------------------------------------------------
 def _load_oi_history():
     """Import scripts/oi_history.py as a module (it lives outside the package)."""
@@ -1187,90 +1137,6 @@ def _load_oi_history():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
-
-
-def test_open_close_column_matching_flexible_spellings():
-    # The CSV column matcher must accept common vendor spellings (case/punct-insensitive).
-    oih = _load_oi_history()
-    fields = ["Underlying", "Expiration Date", "Strike Price", "Call/Put",
-              "Cust Open Buy", "Cust Open Sell"]
-    assert oih._oc_col(fields, "underlying") == "Underlying"
-    assert oih._oc_col(fields, "expiry") == "Expiration Date"
-    assert oih._oc_col(fields, "strike") == "Strike Price"
-    assert oih._oc_col(fields, "cp") == "Call/Put"
-    assert oih._oc_col(fields, "cust_open_buy") == "Cust Open Buy"
-    assert oih._oc_col(fields, "cust_open_sell") == "Cust Open Sell"
-    assert oih._oc_col(fields, "nonexistent") is None
-
-
-def test_load_open_close_parses_and_validates(tmp_path):
-    # A well-formed CSV parses to canonical keys; a missing column raises ValueError.
-    oih = _load_oi_history()
-    good = tmp_path / "oc.csv"
-    good.write_text(
-        "underlying,expiry,strike,cp,cust_open_buy,cust_open_sell\n"
-        "SPY,2026-08-21,590,put,5000,1000\n"
-        "SPY,2026-08-21,600,call,200,3000\n"
-        "QQQ,2026-08-21,500,put,900,100\n")
-    rows = oih.load_open_close(str(good))
-    assert len(rows) == 3
-    r0 = rows[0]
-    assert r0["underlying"] == "SPY" and r0["cp"] == "put" and r0["strike"] == 590.0
-    assert r0["cust_open_buy"] == 5000.0 and r0["cust_open_sell"] == 1000.0
-
-    bad = tmp_path / "bad.csv"
-    bad.write_text("underlying,expiry,strike,cp\nSPY,2026-08-21,590,put\n")
-    with pytest.raises(ValueError):
-        oih.load_open_close(str(bad))
-
-
-def test_dealer_sign_report_put_assumption_supported():
-    # Customers net-BOUGHT puts (open buy > open sell) -> dealers SHORT puts ->
-    # the standard put_sign = -1 assumption is supported.
-    oih = _load_oi_history()
-    rows_in = [
-        {"underlying": "SPY", "expiry": "2026-08-21", "strike": 590.0, "cp": "put",
-         "cust_open_buy": 8000.0, "cust_open_sell": 1000.0},   # net +7000 cust buy
-        {"underlying": "SPY", "expiry": "2026-08-21", "strike": 600.0, "cp": "call",
-         "cust_open_buy": 500.0, "cust_open_sell": 4000.0},    # net -3500 cust (sold calls)
-    ]
-    rows, s = oih.dealer_sign_report(rows_in, "SPY", 20)
-    assert s["n_put_strikes"] == 1
-    assert s["n_put_dealer_short"] == 1
-    assert s["n_put_dealer_long"] == 0
-    assert s["net_customer_put_opening"] == 7000.0
-    assert s["assumption_holds"] is True
-    # Dealer sign is the OPPOSITE of the customer opening side.
-    put_row = next(r for r in rows if r[2] == "put")
-    assert put_row[5] == -1.0          # dealers SHORT the 590 put
-    call_row = next(r for r in rows if r[2] == "call")
-    assert call_row[5] == 1.0          # customers net-sold calls -> dealers LONG calls
-
-
-def test_dealer_sign_report_put_assumption_fails():
-    # Customers net-SOLD puts -> dealers LONG puts -> put_sign = -1 assumption FAILS.
-    oih = _load_oi_history()
-    rows_in = [
-        {"underlying": "SPY", "expiry": "2026-08-21", "strike": 590.0, "cp": "put",
-         "cust_open_buy": 500.0, "cust_open_sell": 9000.0},    # net -8500 cust (sold puts)
-    ]
-    rows, s = oih.dealer_sign_report(rows_in, "SPY", 20)
-    assert s["n_put_dealer_long"] == 1
-    assert s["net_customer_put_opening"] == -8500.0
-    assert s["assumption_holds"] is False
-    assert rows[0][5] == 1.0           # dealers LONG the 590 put
-
-
-def test_dealer_sign_report_filters_ticker():
-    # Rows for other underlyings are ignored.
-    oih = _load_oi_history()
-    rows_in = [
-        {"underlying": "QQQ", "expiry": "2026-08-21", "strike": 500.0, "cp": "put",
-         "cust_open_buy": 9000.0, "cust_open_sell": 100.0},
-    ]
-    rows, s = oih.dealer_sign_report(rows_in, "SPY", 20)
-    assert rows == []
-    assert s["n_put_strikes"] == 0
 
 
 def test_delta_report_grades_lean_by_opening_ratio(tmp_path, capsys):

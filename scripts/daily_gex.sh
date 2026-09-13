@@ -6,9 +6,9 @@
 #   weekly  -> --all-days 90    (out ~a quarter)          [launchd: Monday]
 #   monthly -> --all-days 150  (structural)               [launchd: 1st of month]
 #
-# Config from .env (see .env.example). Set ONE notifier (PUSHOVER_*/TELEGRAM_*/NTFY_*).
+# Config from .env (see .env.example). Notifications go to ntfy (NTFY_TOPIC).
 # Overrides: GEX_TICKERS ("SPY QQQ"), GEX_{DAILY,WEEKLY,MONTHLY}_DAYS, GEX_SEND_CHARTS,
-#            GEX_TICKER (legacy single ticker), GEX_PY, GEX_DIR.
+#            GEX_PY, GEX_DIR.
 set -uo pipefail
 
 CADENCE="${1:-daily}"
@@ -23,7 +23,7 @@ GEX_DIR="${GEX_DIR:-/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure}"
 GEX_PY="${GEX_PY:-/opt/anaconda3/bin/python}"
 cd "$GEX_DIR" || exit 1
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
-TICKERS="${GEX_TICKERS:-${GEX_TICKER:-SPY QQQ}}"   # GEX_TICKER kept for back-compat
+TICKERS="${GEX_TICKERS:-SPY QQQ}"
 SEND_CHARTS="${GEX_SEND_CHARTS:-1}"
 mkdir -p "$GEX_DIR/logs"
 LOG="$GEX_DIR/logs/daily_gex.log"
@@ -67,7 +67,7 @@ elif [ "$N_FAIL" -gt 0 ]; then
 fi
 RC_ALL=$N_FAIL
 
-# ---- notifiers (first configured one wins) ----
+# ---- notifier (ntfy) ----
 # curl exits 0 on HTTP 4xx/5xx unless told otherwise, so a rejected push used to
 # be logged as a SUCCESS ("notified via ntfy") while nothing was delivered.
 # Every send now checks the actual status code and reports the failure.
@@ -100,17 +100,7 @@ ascii() { printf '%s' "$1" | LC_ALL=C tr -cd '\11\12\40-\176'; }
 send_text() {  # title body
     local title body
     title="$(ascii "$1")"; body="$2"
-    if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-        [ -n "$(http_send pushover --form-string "token=$PUSHOVER_TOKEN" \
-              --form-string "user=$PUSHOVER_USER" --form-string "title=$title" \
-              --form-string "message=$body" https://api.pushover.net/1/messages.json)" ] \
-            && echo pushover || echo FAILED
-    elif [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-        [ -n "$(http_send telegram -F "chat_id=$TELEGRAM_CHAT_ID" \
-              -F "text=$(printf '%s\n%s' "$title" "$body")" \
-              "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage")" ] \
-            && echo telegram || echo FAILED
-    elif [ -n "${NTFY_TOPIC:-}" ]; then
+    if [ -n "${NTFY_TOPIC:-}" ]; then
         [ -n "$(http_send ntfy -H "Title: $title" -H "X-Priority: ${NTFY_PRIORITY:-default}" \
               --data-binary "$body" "${NTFY_SERVER:-https://ntfy.sh}/$NTFY_TOPIC")" ] \
             && echo ntfy || echo FAILED
@@ -123,16 +113,7 @@ send_image() {  # title imgpath
     local title img
     title="$(ascii "$1")"; img="$2"
     [ -f "$img" ] || return 0
-    if [ -n "${PUSHOVER_TOKEN:-}" ] && [ -n "${PUSHOVER_USER:-}" ]; then
-        http_send pushover-img --form-string "token=$PUSHOVER_TOKEN" \
-            --form-string "user=$PUSHOVER_USER" --form-string "title=$title" \
-            --form-string "message=$(basename "$img" .png)" \
-            -F "attachment=@$img" https://api.pushover.net/1/messages.json >/dev/null
-    elif [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-        http_send telegram-img -F "chat_id=$TELEGRAM_CHAT_ID" -F "photo=@$img" \
-            -F "caption=$title" \
-            "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendPhoto" >/dev/null
-    elif [ -n "${NTFY_TOPIC:-}" ]; then
+    if [ -n "${NTFY_TOPIC:-}" ]; then
         http_send ntfy-img -H "Title: $title" -H "Filename: $(basename "$img")" \
             -T "$img" "${NTFY_SERVER:-https://ntfy.sh}/$NTFY_TOPIC" >/dev/null
     fi
@@ -146,7 +127,7 @@ if [ "$USED" != none ] && [ "$USED" != FAILED ] && [ "${#CHARTS[@]}" -gt 0 ]; th
 fi
 
 if [ "$USED" = none ]; then
-    echo "[$(ts)] WARNING: no notifier configured -- set PUSHOVER_*/TELEGRAM_*/NTFY_* in .env" >>"$LOG"
+    echo "[$(ts)] WARNING: no notifier configured -- set NTFY_TOPIC in .env" >>"$LOG"
 elif [ "$USED" = FAILED ]; then
     # Loud, because a silently-dropped push is indistinguishable from "no news".
     echo "[$(ts)] *** NOTIFY FAILED (${NOTIFY_ERR:-unknown}) *** $TAG was NOT delivered." >>"$LOG"

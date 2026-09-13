@@ -91,7 +91,7 @@ def main(argv=None):
         tp = os.environ.get("SCHWAB_TOKEN_PATH", gex.DEFAULT_TOKEN_PATH)
         with open(tp) as f:
             cur = _j.load(f)
-        ct = datetime.fromtimestamp(cur["creation_timestamp"], tz=gex._et_tz())
+        ct = datetime.fromtimestamp(cur["creation_timestamp"], tz=gex.ET)
         age_h = (gex.now_et() - ct).total_seconds() / 3600.0
         print("  current token      : rt={}  created {} ET ({:.1f}h ago)".format(
             gex._token_fingerprint(cur), ct.strftime("%Y-%m-%d %H:%M:%S"), age_h))

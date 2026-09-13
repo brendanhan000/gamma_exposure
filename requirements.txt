@@ -1,6 +1,5 @@
 # gex.py core dependencies. Python 3.11+ recommended (core code is 3.9+ compatible).
 numpy>=1.24
-scipy>=1.10
 matplotlib>=3.6
 pytest>=7.0
 

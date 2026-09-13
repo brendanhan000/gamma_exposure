@@ -148,8 +148,9 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, date, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -224,9 +225,7 @@ class DealerConvention:
     label: str = "standard (dealers long calls, short puts)"
 
 
-# Standard convention and the "flipped put sign" used for the sensitivity check.
-CONV_STANDARD = DealerConvention(1.0, -1.0, "standard (dealers long calls, short puts)")
-CONV_FLIPPED  = DealerConvention(1.0,  1.0, "flipped put sign (dealers long calls AND long puts)")
+CONV_STANDARD = DealerConvention()
 
 
 @dataclass
@@ -239,7 +238,6 @@ class Config:
     price_range: float = DEFAULT_PRICE_RANGE
     steps: int = DEFAULT_GRID_STEPS
     convention: DealerConvention = field(default_factory=lambda: CONV_STANDARD)
-    flipped_convention: DealerConvention = field(default_factory=lambda: CONV_FLIPPED)
 
 
 # ===========================================================================
@@ -297,7 +295,7 @@ def compute_gamma_bsm(S, K, T, sigma, r=DEFAULT_RATE, q=0.0):
 #     actually driving the tape. This is the single biggest intraday error
 #     source. The flip and nearest walls move as spot traverses strikes and as
 #     0DTE volume builds, so this profile must be recomputed on a fast cadence
-#     (see --watch); a level computed at 09:35 is not the level at 13:00.
+#     (re-run it, or refresh the phone app); a level computed at 09:35 is not the level at 13:00.
 #
 #   STRUCTURAL (overview layer) -- every expiry in the window, weighted by OI
 #     ONLY. Volume is today's churn; OI is durable positioning. This profile
@@ -376,7 +374,7 @@ def is_rth(now=None):
     return 9 * 60 + 30 <= mins < 16 * 60
 
 
-def option_price(c, prefer="mid"):
+def option_price(c):
     """Best available price for one contract: mid of the quote, else last.
 
     Mid ((bid+ask)/2) is the standard mark for straddle pricing -- `last` can be
@@ -384,14 +382,10 @@ def option_price(c, prefer="mid"):
     implied move. Returns None when nothing usable exists.
     """
     b, a, l = c.bid, c.ask, c.last
-    if prefer == "mid" and b is not None and a is not None and a >= b and a > 0:
-        mid = 0.5 * (b + a)
-        if mid > 0:
-            return mid
-    if l is not None and l > 0:
-        return float(l)
     if b is not None and a is not None and a >= b and a > 0:
         return 0.5 * (b + a)
+    if l is not None and l > 0:
+        return float(l)
     return None
 
 
@@ -402,7 +396,7 @@ def option_price(c, prefer="mid"):
 STRADDLE_TO_SD = math.sqrt(math.pi / 2.0)          # 1.2533
 
 
-def atm_straddle_move(contracts, spot, expiry=None, prefer="mid"):
+def atm_straddle_move(contracts, spot, expiry=None):
     """Implied move from the ATM straddle: (ATM call + ATM put) / spot.
 
     This is the market's own priced-in move and is more precise than the VIX/16
@@ -428,7 +422,7 @@ def atm_straddle_move(contracts, spot, expiry=None, prefer="mid"):
     # Index priced calls/puts by strike, then take the nearest strike quoting both.
     calls, puts = {}, {}
     for c in sel:
-        px = option_price(c, prefer)
+        px = option_price(c)
         if px is None:
             continue
         (calls if c.cp == "call" else puts)[c.strike] = (px, c)
@@ -463,7 +457,6 @@ def atm_straddle_move(contracts, spot, expiry=None, prefer="mid"):
         "iv_atm": iv_atm,
         "iv_sd_pct": iv_sd_pct,
         "T": T,
-        "priced_from": prefer,
     }
 
 
@@ -571,29 +564,19 @@ def _total_net_gex_at(S, K, T, iv, oi, sign, cfg):
 
 
 def _refine_root(f, x0, x1):
-    """Refine a bracketed root of f to machine precision.
-
-    Uses Brent's method (scipy.optimize.brentq) when available; falls back to
-    bisection otherwise. Both x0 and x1 must bracket a sign change (f(x0) and
-    f(x1) opposite signs, neither zero). Returns the root as a float.
-    """
-    try:
-        from scipy.optimize import brentq
-        return float(brentq(f, x0, x1, xtol=1e-10, rtol=1e-12, maxiter=100))
-    except Exception:
-        # Bisection fallback: robust, no scipy dependency.
-        a, b = float(x0), float(x1)
-        fa, fb = f(a), f(b)
-        for _ in range(200):
-            m = 0.5 * (a + b)
-            fm = f(m)
-            if fm == 0.0 or (b - a) < 1e-10:
-                return m
-            if fa * fm < 0.0:
-                b, fb = m, fm
-            else:
-                a, fa = m, fm
-        return 0.5 * (a + b)
+    """Bisect a bracketed root of f (f(x0), f(x1) opposite signs) to 1e-10."""
+    a, b = float(x0), float(x1)
+    fa = f(a)
+    for _ in range(200):
+        m = 0.5 * (a + b)
+        fm = f(m)
+        if fm == 0.0 or (b - a) < 1e-10:
+            return m
+        if fa * fm < 0.0:
+            b = m
+        else:
+            a, fa = m, fm
+    return 0.5 * (a + b)
 
 
 def find_flip_level(contracts, spot, convention, cfg, price_range=None, steps=None):
@@ -601,8 +584,8 @@ def find_flip_level(contracts, spot, convention, cfg, price_range=None, steps=No
 
     For each hypothetical spot S' in [spot*(1-range), spot*(1+range)] we recompute
     gamma for every contract and sum the signed dollar-GEX, then locate sign
-    changes. Each bracketed crossing is refined to machine precision with Brent's
-    method (the net-GEX curve is smooth but can be near-discontinuous for 0DTE,
+    changes. Each bracketed crossing is refined to machine precision by bisection
+    (the net-GEX curve is smooth but can be near-discontinuous for 0DTE,
     where linear interpolation across a wide grid cell is a poor model). Returns
     the crossing nearest the current spot as 'flip' (None if there is no crossing
     in range), plus all 'crossings' and the ('grid','curve') for plotting/debugging.
@@ -624,40 +607,12 @@ def find_flip_level(contracts, spot, convention, cfg, price_range=None, steps=No
     def f(S):
         return _total_net_gex_at(S, K, T, iv, oi, sign, cfg)
 
-    # Locate zero crossings. A real crossing is a sign change between adjacent
-    # nodes. Exact-zero nodes (float underflow in the wings) are ignored unless
-    # they sit between two non-zero nodes of opposite sign (a genuine touch).
-    crossings = []
-    n = len(grid)
-    for i in range(n - 1):
-        y0, y1 = curve[i], curve[i + 1]
-        if y0 == 0.0 and y1 == 0.0:
-            continue                      # flat underflowed wing: not a crossing
-        if y0 == 0.0 or y1 == 0.0:
-            # One node exactly zero: a crossing only if the surrounding non-zero
-            # values straddle zero. Find nearest non-zero on each side.
-            left = y0
-            if left == 0.0:
-                j = i - 1
-                while j >= 0 and curve[j] == 0.0:
-                    j -= 1
-                left = curve[j] if j >= 0 else 0.0
-            right = y1
-            if right == 0.0:
-                j = i + 2
-                while j < n and curve[j] == 0.0:
-                    j += 1
-                right = curve[j] if j < n else 0.0
-            if left != 0.0 and right != 0.0 and left * right < 0.0:
-                # Genuine sign change across a zero node; refine on the wider
-                # bracket that contains the change.
-                lo = grid[i] if y0 != 0.0 else grid[i]
-                hi = grid[i + 1] if y1 != 0.0 else grid[i + 1]
-                crossings.append(_refine_root(f, lo, hi) if (f(lo) * f(hi) < 0.0)
-                                 else float(0.5 * (lo + hi)))
-            continue
-        if y0 * y1 < 0.0:
-            crossings.append(_refine_root(f, grid[i], grid[i + 1]))
+    # Sign changes between consecutive NON-ZERO nodes; exact zeros (underflow in
+    # the flat wings) are skipped so they never register as phantom crossings.
+    nz = np.flatnonzero(curve)
+    s = np.sign(curve[nz])
+    crossings = [_refine_root(f, grid[nz[j]], grid[nz[j + 1]])
+                 for j in np.flatnonzero(s[:-1] != s[1:])]
 
     crossings = np.array(sorted(set(crossings)), dtype=float)
     nearest = None
@@ -691,21 +646,10 @@ def _decayed_contracts(contracts, decay_seconds):
     and floor the survivors at the same T_FLOOR used for the live snapshot so
     the projection is numerically consistent with the live number.
     """
-    out = []
-    for c in contracts:
-        secs = c.T * (DAY_COUNT * 24.0 * 3600.0) - decay_seconds
-        if secs <= 0:
-            continue                      # expires before the projection horizon
-        secs = max(secs, T_FLOOR_SECONDS)
-        d = Contract(c.strike, c.expiry, c.cp, c.oi, c.iv,
-                     T=secs / (DAY_COUNT * 24.0 * 3600.0))
-        # Carry the exposure weight through: without this the decayed flip is
-        # computed on raw OI while flip_now used the blended (OI+volume) weight,
-        # so the projected "migration" would partly reflect a weighting change
-        # rather than pure time decay.
-        d.size = c.size
-        out.append(d)
-    return out
+    year_s = DAY_COUNT * 24.0 * 3600.0
+    return [replace(c, T=max(secs, T_FLOOR_SECONDS) / year_s)
+            for c in contracts
+            if (secs := c.T * year_s - decay_seconds) > 0]
 
 
 def flip_time_decay(contracts, spot, cfg, now):
@@ -723,14 +667,8 @@ def flip_time_decay(contracts, spot, cfg, now):
     """
     secs_to_close = seconds_to_expiry(now.date(), now)
     flip_now = find_flip_level(contracts, spot, cfg.convention, cfg)["flip"]
-    if secs_to_close <= 0 or not contracts:
-        return {"flip_now": flip_now, "flip_close": None, "move": None,
-                "seconds": secs_to_close}
-    decayed = _decayed_contracts(contracts, secs_to_close)
-    if not decayed:
-        return {"flip_now": flip_now, "flip_close": None, "move": None,
-                "seconds": secs_to_close}
-    flip_close = find_flip_level(decayed, spot, cfg.convention, cfg)["flip"]
+    decayed = _decayed_contracts(contracts, secs_to_close) if secs_to_close > 0 else []
+    flip_close = find_flip_level(decayed, spot, cfg.convention, cfg)["flip"] if decayed else None
     move = (flip_close - flip_now) if (flip_now is not None and flip_close is not None) else None
     return {"flip_now": flip_now, "flip_close": flip_close, "move": move,
             "seconds": secs_to_close}
@@ -803,26 +741,19 @@ def find_walls(profile, spot=None):
 # ===========================================================================
 # Time-to-expiry helpers
 # ===========================================================================
-def _et_tz():
-    """America/New_York tz (handles DST). Falls back to a fixed -04:00 offset."""
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo("America/New_York")
-    except Exception:
-        return timezone(timedelta(hours=-4))
+ET = ZoneInfo("America/New_York")
 
 
 def now_et():
-    return datetime.now(tz=_et_tz())
+    return datetime.now(tz=ET)
 
 
 def seconds_to_expiry(expiry, now):
     """Seconds from `now` to 16:00 ET on the expiration date (can be negative)."""
-    et = _et_tz()
     expiry_dt = datetime(expiry.year, expiry.month, expiry.day,
-                         EXPIRY_HOUR_ET, 0, 0, tzinfo=et)
+                         EXPIRY_HOUR_ET, 0, 0, tzinfo=ET)
     if now.tzinfo is None:
-        now = now.replace(tzinfo=et)
+        now = now.replace(tzinfo=ET)
     return (expiry_dt - now).total_seconds()
 
 
@@ -916,8 +847,8 @@ def to_schwab_symbol(ticker):
 #      built from the token file. After any other login/refresh rewrites that
 #      file, the cached client still holds the OLD refresh token; the next time
 #      it refreshes it presents a superseded token and kills the new one too.
-#      -> Fix: schwab_client_stale() lets holders notice the file changed and
-#         rebuild. (Observed live: a server started Jul 23 revoked an Aug 2 login.)
+#      -> Fix: reload_client_if_stale() notices the file changed and
+#         rebuilds. (Observed live: a server started Jul 23 revoked an Aug 2 login.)
 #
 #   2. CONCURRENT REFRESH: two processes refreshing at once each rotate the
 #      token, invalidating the other's. -> Fix: token_lock() serializes API calls
@@ -962,11 +893,7 @@ def token_audit(event, path, payload=None, note=""):
     """Append one forensic line. Never raises -- diagnostics must not break runs."""
     try:
         os.makedirs(os.path.dirname(TOKEN_AUDIT_LOG) or ".", exist_ok=True)
-        try:
-            with open("/proc/self/cmdline") as f:      # Linux
-                cmd = f.read().replace("\0", " ").strip()
-        except Exception:
-            cmd = " ".join(os.path.basename(a) for a in sys.argv[:3])
+        cmd = " ".join(os.path.basename(a) for a in sys.argv[:3])
         exp = ""
         if isinstance(payload, dict):
             t = payload.get("token") or payload
@@ -1012,69 +939,32 @@ def _token_writer(path):
     return write
 
 
-_lock_depth = {"n": 0}          # re-entrancy guard (flock is per-fd, not per-process)
-
-
 @contextmanager
 def token_lock(token_path, timeout=120.0, poll=0.25):
     """Cross-process exclusive lock guarding Schwab API calls (refresh rotation).
 
     Uses a sidecar '<token>.lock' file so the token itself is never truncated.
     On timeout it proceeds UNLOCKED rather than failing the run: a possible race
-    is better than a guaranteed outage.
-
-    RE-ENTRANT within a process: nesting (e.g. a session wrapper around a fetch
-    that also locks) would otherwise deadlock, because flock on a second file
-    descriptor blocks against our own held lock.
+    is better than a guaranteed outage. NOT re-entrant: flock is per-fd, so a
+    nested acquire blocks against the outer one until the timeout.
     """
-    if not token_path or _lock_depth["n"] > 0:
-        _lock_depth["n"] += 1
-        try:
-            yield
-        finally:
-            _lock_depth["n"] -= 1
+    if not token_path:
+        yield
         return
-    lock_path = token_path + ".lock"
-    fh = None
-    locked = False
-    _lock_depth["n"] = 1
-    try:
-        fh = open(lock_path, "a+")
+    with open(token_path + ".lock", "a+") as fh:
         deadline = time.time() + timeout
         while True:
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
                 break
-            except (IOError, OSError):
+            except OSError:
                 if time.time() >= deadline:
                     break
                 time.sleep(poll)
-        yield
-    finally:
-        _lock_depth["n"] = 0
-        if fh is not None:
-            if locked:
-                try:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-                except (IOError, OSError):
-                    pass
-            fh.close()
+        yield          # closing fh releases the flock
 
 
-def schwab_client_stale(client):
-    """True if the token file changed on disk since `client` was built.
-
-    Long-lived holders MUST check this before use and rebuild when stale, or they
-    will eventually present a superseded refresh token and revoke the family.
-    """
-    path = getattr(client, "_gex_token_path", None)
-    if not path:
-        return False
-    return _token_mtime(path) != getattr(client, "_gex_token_mtime", None)
-
-
-def get_schwab_client(app_key, app_secret, token_path, callback=DEFAULT_CALLBACK):
+def get_schwab_client(app_key, app_secret, token_path):
     """Build a schwab-py client from a cached token file.
 
     OAuth and token refresh are delegated to schwab-py (the token is written by
@@ -1109,7 +999,7 @@ def get_schwab_client(app_key, app_secret, token_path, callback=DEFAULT_CALLBACK
     except Exception:
         pass
     # Stamp the source file + its mtime so holders can detect a rewritten token
-    # (see schwab_client_stale) instead of presenting a superseded refresh token.
+    # (see reload_client_if_stale) instead of presenting a superseded refresh token.
     client._gex_token_path = token_path
     client._gex_token_mtime = _token_mtime(token_path)
     client._gex_app_key = app_key            # kept so the client can be REBUILT
@@ -1156,14 +1046,8 @@ def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_coun
     are raised immediately: retrying an expired refresh token cannot help, only
     a re-login can (scripts/schwab_setup.py).
     """
-    kwargs = {"include_underlying_quote": True}
-    if from_date is not None:
-        kwargs["from_date"] = from_date
-    if to_date is not None:
-        kwargs["to_date"] = to_date
-    if strike_count is not None:
-        kwargs["strike_count"] = strike_count
-
+    kwargs = {"include_underlying_quote": True, "from_date": from_date,
+              "to_date": to_date, "strike_count": strike_count}
     last = None
     tok_path = getattr(client, "_gex_token_path", None)
     for attempt in range(max_retries):
@@ -1188,6 +1072,14 @@ def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_coun
             if attempt < max_retries - 1:
                 time.sleep(retry_wait * (attempt + 1))   # e.g. 5s, then 10s
     raise last
+
+
+def _f(x):
+    """float(x), or None when x is missing or not numeric."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_schwab_chain(data):
@@ -1252,14 +1144,7 @@ def parse_schwab_chain(data):
                         continue
 
                     # ---- quote-quality filters (see docstring) ----
-                    try:
-                        bidf = float(o["bid"]) if o.get("bid") is not None else None
-                    except (TypeError, ValueError):
-                        bidf = None
-                    try:
-                        askf = float(o["ask"]) if o.get("ask") is not None else None
-                    except (TypeError, ValueError):
-                        askf = None
+                    bidf, askf = _f(o.get("bid")), _f(o.get("ask"))
                     # Crossed market (bid > ask) is stale/locked data anywhere.
                     # The ask>0 guard previously let a crossed-to-ZERO quote
                     # (bid > ask == 0, common pre-open) slip through; bid > ask
@@ -1279,17 +1164,10 @@ def parse_schwab_chain(data):
                                 dropped["itm_bad_quote"] += 1
                                 continue
 
-                    try:
-                        vol = float(o.get("totalVolume") or 0.0)
-                    except (TypeError, ValueError):
-                        vol = 0.0
-                    try:
-                        lastf = float(o["last"]) if o.get("last") is not None else None
-                    except (TypeError, ValueError):
-                        lastf = None
                     contracts.append(Contract(strike, exp_date, cp,
-                                              float(oi), ivf / 100.0, volume=vol,
-                                              bid=bidf, ask=askf, last=lastf))
+                                              float(oi), ivf / 100.0,
+                                              volume=_f(o.get("totalVolume")) or 0.0,
+                                              bid=bidf, ask=askf, last=_f(o.get("last"))))
     return contracts, spot, ts_ns, dropped, status
 
 
@@ -1435,7 +1313,8 @@ def compute_view(contracts, spot, cfg, now=None):
     # Spec-required literal check: flip the put sign (puts -> +). This makes every
     # contribution positive, so the flip typically VANISHES -- an honest sign that
     # the flip's existence rests on the short-put assumption.
-    flip_flp = find_flip_level(contracts, spot, cfg.flipped_convention, cfg)
+    flipped = replace(cfg.convention, put_sign=-cfg.convention.put_sign)
+    flip_flp = find_flip_level(contracts, spot, flipped, cfg)
     # Graded sensitivity: vary the short-put MAGNITUDE +/-50% so we get a real
     # "how far does it move" number (the binary flip alone never crosses zero).
     base_put = cfg.convention.put_sign
@@ -1443,6 +1322,10 @@ def compute_view(contracts, spot, cfg, now=None):
     if base_put != 0:
         for scale in (0.5, 1.5):
             flip_band[scale] = _flip_with_put_sign(contracts, spot, cfg, base_put * scale)
+    flip = flip_std["flip"]
+    band_vals = [v for v in flip_band.values() if v is not None]
+    band_move = max(abs(v - flip) for v in band_vals) if (flip is not None and band_vals) else None
+    low_conf = flip is None or (band_move is not None and band_move > MATERIAL_FLIP_MOVE * spot)
     gross = gross_dollar_gamma(contracts, spot, cfg)
     decay = flip_time_decay(contracts, spot, cfg, now)
     return {
@@ -1453,6 +1336,8 @@ def compute_view(contracts, spot, cfg, now=None):
         "flip_std": flip_std,
         "flip_flipped": flip_flp,
         "flip_band": flip_band,
+        "band_move": band_move,
+        "low_confidence": low_conf,
         "flip_decay": decay,
         "total": profile["total"],
         "gross": gross,
@@ -1576,7 +1461,7 @@ def print_data_health(spot, ts_ns, dropped, dropped_expired, floored, n_kept, to
     print("  Spot used ........... {}".format(fmt_px(spot)))
     if ts_ns:
         try:
-            t = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).astimezone(_et_tz())
+            t = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).astimezone(ET)
             age = (now_et() - t).total_seconds()
             print("  Underlying snapshot . {} ET  (age {:.0f}s)".format(t.strftime("%Y-%m-%d %H:%M:%S"), age))
         except Exception:
@@ -1611,16 +1496,10 @@ def print_side_by_side(views, today=None):
     header = "  {:<26}".format("") + "".join("{:>22}".format(l) for l in labels)
     print(header)
 
-    def short_empty(lbl):
-        if today is not None and "0DTE" in lbl.upper() \
-                and today.weekday() < 5 and seconds_to_expiry(today, now_et()) <= 0:
-            return "(expired 16:00)"
-        return "(none)"
-
     def row(name, fn):
         cells = ""
         for lbl, v in views:
-            cells += "{:>22}".format(short_empty(lbl) if v.get("empty") else fn(v))
+            cells += "{:>22}".format("(none)" if v.get("empty") else fn(v))
         print("  {:<26}{}".format(name, cells))
 
     row("Total net GEX", lambda v: fmt_bn(v["total"]))
@@ -1727,26 +1606,19 @@ def print_view_detail(label, view, spot, spy_ratio, cfg, today):
         print("    Literal put-sign flip (puts -> long) ....... {} (base had no flip in range)"
               .format(fmt_px(flip_flp)))
 
-    low_conf = False
-    band_vals = [v for v in band.values() if v is not None]
-    if flip is not None and band_vals:
-        allv = band_vals + [flip]
-        lo, hi = min(allv), max(allv)
-        move = max(abs(hi - flip), abs(lo - flip))
+    move = view["band_move"]
+    if move is not None:
+        allv = [v for v in band.values() if v is not None] + [flip]
         print("    Short-put magnitude +/-50% ................. flip in [{:,.2f} .. {:,.2f}]"
-              .format(lo, hi))
+              .format(min(allv), max(allv)))
         print("                                                 max move {:,.2f} SPX = {:.2f}% of spot"
               .format(move, move / spot * 100.0))
-        if move > MATERIAL_FLIP_MOVE * spot:
-            low_conf = True
-    elif flip is None:
-        low_conf = True  # we couldn't even locate a base flip in range
 
-    if low_conf:
+    if view["low_confidence"]:
         print("    *** LOW CONFIDENCE: the flip level is materially sensitive to the")
         print("        (assumed) dealer put positioning. Treat the regime as directional")
         print("        context, not a precise level. ***")
-    elif flip is not None and band_vals:
+    elif move is not None:
         print("    OK: flip is robust to a +/-50% change in the short-put magnitude")
         print("        (< {:.0%} of spot), though it still hinges on dealers being short puts."
               .format(MATERIAL_FLIP_MOVE))
@@ -1804,16 +1676,12 @@ def render_summary(label, view, spot, spy_ratio, cfg, today):
 # Plot
 # ===========================================================================
 def plot_profile(label, view, spot, flip, walls, ticker, outpath,
-                 window_frac=PLOT_WINDOW_FRAC, x_tick_step=10.0):
-    """Per-strike net-GEX bar chart with spot / flip / walls marked. Saved to file.
-
-    The x-axis (price) is ticked and gridded on round multiples of `x_tick_step`
-    (default 10), auto-coarsened for high-priced underlyings so labels stay legible.
-    """
+                 window_frac=PLOT_WINDOW_FRAC):
+    """Per-strike net-GEX bar chart with spot / flip / walls marked. Saved to file."""
     import matplotlib
     matplotlib.use("Agg")  # headless / no display needed
     import matplotlib.pyplot as plt
-    from matplotlib.ticker import MultipleLocator
+    from matplotlib.ticker import MaxNLocator
 
     profile = view["profile"]
     strikes = profile["strikes"]
@@ -1842,25 +1710,12 @@ def plot_profile(label, view, spot, flip, walls, ticker, outpath,
         ax.axvline(walls["put_wall"], color="#d73027", ls=":", lw=1.8,
                    label="put wall {:,.0f}".format(walls["put_wall"]))
 
-    # X-axis on round price levels: ticks + gridlines every `x_tick_step` (default
-    # 10). Coarsen to a nice multiple (x2, x2.5, x2 -> 20, 50, 100, ...) if the
-    # window would produce too many ticks, so high-priced names (e.g. SPX) stay
-    # readable; multiples of 10 are unaffected for SPY/QQQ-priced underlyings.
-    base = float(x_tick_step) if x_tick_step and x_tick_step > 0 else 10.0
-    span = float(ks.max() - ks.min()) if ks.size else 0.0
-    step = base
-    _bumps = (2.0, 2.5, 2.0)
-    _i = 0
-    while span > 0 and span / step > 25:
-        step *= _bumps[_i % 3]
-        _i += 1
-    ax.xaxis.set_major_locator(MultipleLocator(step))
-    if span > 0 and span / step > 15:   # rotate only when ticks get dense
-        ax.tick_params(axis="x", labelrotation=45)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=25, steps=[1, 2, 2.5, 5, 10]))
+    ax.tick_params(axis="x", labelrotation=45)
 
     ax.set_title("{} dealer GEX profile - {}  (green=long gamma, red=short gamma)"
                  .format(ticker, label))
-    ax.set_xlabel("strike / price level  (gridlines every {:g})".format(step))
+    ax.set_xlabel("strike / price level")
     ax.set_ylabel("net dealer GEX  ($Bn per 1% move)")
     ax.legend(loc="best", fontsize=9)
     ax.grid(True, axis="both", alpha=0.3, linestyle=":")
@@ -1940,31 +1795,19 @@ def parse_args(argv=None):
     p.add_argument("--multiplier", type=int, default=DEFAULT_MULTIPLIER, help="contract multiplier.")
     p.add_argument("--price-range", type=float, default=DEFAULT_PRICE_RANGE, help="+/- fraction for flip search.")
     p.add_argument("--steps", type=int, default=DEFAULT_GRID_STEPS, help="grid steps for flip search.")
-    p.add_argument("--convention", choices=["standard", "flipped"], default="standard",
-                   help="dealer sign convention. standard=long calls/short puts.")
-    p.add_argument("--call-sign", type=float, default=None, help="override dealer call sign (+1/-1).")
     p.add_argument("--put-sign", type=float, default=None, help="override dealer put sign (+1/-1).")
     p.add_argument("--all-days", type=int, default=45,
                    help="for 'all'/default: fetch expiries from today out this many days. "
                         "Kept modest because Schwab 502s on very large chains (e.g. a full "
                         "year of SPX); raise it for more coverage at the risk of a 502.")
     p.add_argument("--out-prefix", default=None, help="output chart filename prefix.")
-    p.add_argument("--x-tick", type=float, default=10.0,
-                   help="chart x-axis tick/gridline spacing in price levels "
-                        "(auto-coarsened for high-priced underlyings).")
     p.add_argument("--no-plot", action="store_true", help="skip chart generation.")
-    p.add_argument("--callback", default=os.environ.get("SCHWAB_CALLBACK_URL", DEFAULT_CALLBACK),
-                   help="OAuth callback URL; must EXACTLY match your Schwab app config.")
     p.add_argument("--token-path", default=None,
                    help="Schwab token file (default .schwab_token.json or $SCHWAB_TOKEN_PATH). "
                         "Create it with: python3 scripts/schwab_setup.py")
     p.add_argument("--profiles", action="store_true",
                    help="show the INTRADAY (front-week + next OpEx, OI blended with "
                         "today's volume) and STRUCTURAL (all expiries, OI only) profiles.")
-    p.add_argument("--watch", type=int, default=0, metavar="SECONDS",
-                   help="re-fetch and re-print the intraday profile every N seconds "
-                        "(60 is a sensible cadence). Intraday the flip moves with spot "
-                        "and as 0DTE volume builds. Ctrl-C to stop.")
     p.add_argument("--levels-only", action="store_true",
                    help="print only a compact levels block (for notifications / quick pulls).")
     p.add_argument("--no-save-chain", action="store_true",
@@ -1976,28 +1819,25 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def div_yield_for(ticker, override=None):
+    """(q, source): explicit override wins; else the built-in per-ticker map; else 0."""
+    base = ticker.upper().lstrip("$")
+    if override is not None:
+        return override, "explicit override"
+    if base in TICKER_DIV_YIELDS:
+        return TICKER_DIV_YIELDS[base], "built-in map for {} (approx.)".format(base)
+    return 0.0, "default 0 (no map entry for {})".format(base)
+
+
 def build_config(args):
-    conv = CONV_STANDARD if args.convention == "standard" else CONV_FLIPPED
-    # Power-user overrides take precedence and stay auditable in the printed label.
-    if args.call_sign is not None or args.put_sign is not None:
-        cs = args.call_sign if args.call_sign is not None else conv.call_sign
-        ps = args.put_sign if args.put_sign is not None else conv.put_sign
-        conv = DealerConvention(cs, ps, "custom (call_sign={:+.0f}, put_sign={:+.0f})".format(cs, ps))
-    # Sensitivity always flips the put sign relative to the chosen convention.
-    flipped = DealerConvention(conv.call_sign, -conv.put_sign,
-                               "put sign flipped to {:+.0f}".format(-conv.put_sign))
-    # Dividend yield: explicit flag wins; else the built-in per-ticker map ("get
-    # dividends right for single names"); else 0. Source is printed for audit.
-    base = args.ticker.upper().lstrip("$")
-    if args.div_yield is not None:
-        q, q_src = args.div_yield, "--div-yield flag"
-    elif base in TICKER_DIV_YIELDS:
-        q, q_src = TICKER_DIV_YIELDS[base], "built-in map for {} (approx.)".format(base)
-    else:
-        q, q_src = 0.0, "default 0 (no map entry for {})".format(base)
+    conv = CONV_STANDARD
+    if args.put_sign is not None:
+        conv = DealerConvention(conv.call_sign, args.put_sign,
+                                "custom (put_sign={:+.0f})".format(args.put_sign))
+    q, q_src = div_yield_for(args.ticker, args.div_yield)
     return Config(ticker=args.ticker, multiplier=args.multiplier, rate=args.rate,
                   div_yield=q, div_src=q_src, price_range=args.price_range, steps=args.steps,
-                  convention=conv, flipped_convention=flipped)
+                  convention=conv)
 
 
 def prior_trading_session(today):
@@ -2152,7 +1992,6 @@ def print_implied_move(all_contracts, spot, cfg, today, spy_ratio=None):
 HEDGE_VENUES = {
     # multiplier, label, typical daily volume for a sense of scale
     "ES":  (50.0, "ES futures", 1_500_000),
-    "MES": (5.0, "Micro ES futures", 1_200_000),
     "SPY": (1.0, "SPY shares", 75_000_000),
 }
 
@@ -2292,14 +2131,12 @@ def print_profiles(all_contracts, spot, spy_ratio, cfg, today, now=None):
         if key == "intraday":
             # Volume actually blended in -- shows how much of this profile is
             # live flow that prior-close OI would have missed entirely.
-            oi_only = apply_weighting([c for c in cs], "oi", today)
-            base = gross_dollar_gamma(oi_only, spot, cfg)
-            cs2 = select_profile_contracts(all_contracts, "intraday", today)
-            blended = gross_dollar_gamma(cs2, spot, cfg)
+            blended = gross_dollar_gamma(cs, spot, cfg)
+            base = gross_dollar_gamma([replace(c, size=None) for c in cs], spot, cfg)
             if base > 0:
                 print("  volume uplift: {:+.1%} vs OI-only  (today's flow that "
                       "stale OI misses)".format(blended / base - 1.0))
-            cliff = zero_dte_cliff(cs2, spot, cfg, today, now)
+            cliff = zero_dte_cliff(cs, spot, cfg, today, now)
             if cliff:
                 print("  *** 0DTE DECAY CLIFF: {:.0%} of this profile ({} contracts) "
                       "expires".format(cliff["share"], cliff["n"]))
@@ -2325,6 +2162,17 @@ def print_profiles(all_contracts, spot, spy_ratio, cfg, today, now=None):
                   "structure (higher confidence).")
     print()
     return out
+
+
+def fetch_window(expiry_arg, today, all_days):
+    """(from_date, to_date) to fetch for an --expiry value (None = 0DTE + all)."""
+    e = (expiry_arg or "all").lower()
+    if e == "0dte":
+        return today, today
+    if e == "all":
+        return today, today + timedelta(days=all_days)
+    d = date.fromisoformat(expiry_arg)
+    return d, d
 
 
 def select_views(all_contracts, expiry_arg, today):
@@ -2409,7 +2257,7 @@ def run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
             safe = lbl.lower().replace(" ", "_")
             outpath = "{}_{}.png".format(prefix, safe)
             plot_profile(lbl, view, spot, view["flip_std"]["flip"], view["walls"],
-                         cfg.ticker, outpath, x_tick_step=args.x_tick)
+                         cfg.ticker, outpath)
             print("  chart saved: {}".format(outpath))
         print()
 
@@ -2445,9 +2293,9 @@ def main(argv=None):
         # is populated no matter what wall-clock time the demo is run at (after the
         # 16:00 ET close, real 0DTE has expired and would correctly be empty).
         real = now_et()
-        session_close = datetime(today.year, today.month, today.day, 15, 55, tzinfo=_et_tz())
+        session_close = datetime(today.year, today.month, today.day, 15, 55, tzinfo=ET)
         demo_now = real if real < session_close else \
-            datetime(today.year, today.month, today.day, 13, 0, tzinfo=_et_tz())
+            datetime(today.year, today.month, today.day, 13, 0, tzinfo=ET)
         demo = make_demo_chain(spot, today, today + timedelta(days=30))
         all_contracts, dropped_expired, floored = enrich_and_filter_time(demo, demo_now)
         ts_ns = int(demo_now.timestamp() * 1e9)
@@ -2471,22 +2319,12 @@ def main(argv=None):
 
     token_path = args.token_path or os.environ.get("SCHWAB_TOKEN_PATH", DEFAULT_TOKEN_PATH)
     try:
-        client = get_schwab_client(app_key, app_secret, token_path, callback=args.callback)
+        client = get_schwab_client(app_key, app_secret, token_path)
     except RuntimeError as e:
         print("ERROR: {}".format(e), file=sys.stderr)
         return 2
 
-    # Translate --expiry into a date window (date objects for schwab-py). Schwab
-    # returns one un-paginated payload for the whole window; we still partition in
-    # memory so the default run shows 0DTE and all-expiries side by side.
-    if args.expiry and args.expiry.lower() == "0dte":
-        from_date = to_date = today
-    elif args.expiry and args.expiry.lower() == "all":
-        from_date, to_date = today, today + timedelta(days=args.all_days)
-    elif args.expiry:
-        from_date = to_date = date.fromisoformat(args.expiry)  # validated above
-    else:  # default: both 0DTE and all -> fetch the full near-dated window
-        from_date, to_date = today, today + timedelta(days=args.all_days)
+    from_date, to_date = fetch_window(args.expiry, today, args.all_days)
 
     warn = check_futures_symbol(cfg.ticker)
     if warn and warn[0] == "ERROR":
@@ -2552,45 +2390,6 @@ def main(argv=None):
         dropped_expired, floored, rate_is_default)
 
     print("runtime: {:.2f}s".format(time.time() - t_start))
-
-    # --watch: intraday the flip moves as spot traverses strikes and as 0DTE
-    # volume accumulates, so a level computed at the open is not the level at
-    # midday. Re-fetch on a fixed cadence and print only what changed.
-    if args.watch:
-        print("\nWatching {} every {}s (Ctrl-C to stop) ...".format(cfg.ticker, args.watch))
-        prev = None
-        try:
-            while True:
-                time.sleep(args.watch)
-                try:
-                    data = fetch_chain_schwab(client, symbol,
-                                              from_date=from_date, to_date=to_date)
-                    cs, sp, _ts, _dr, _st = parse_schwab_chain(data)
-                    if sp is None:
-                        continue
-                    kept, _de, _fl = enrich_and_filter_time(cs, now_et())
-                    intr = select_profile_contracts(kept, "intraday", today)
-                    if not intr:
-                        continue
-                    v = compute_view(intr, sp, cfg)
-                    flip, w = v["flip_std"]["flip"], v["walls"]
-                    ch = ""
-                    if prev:
-                        d_spot = sp - prev[0]
-                        d_flip = (flip - prev[1]) if (flip and prev[1]) else None
-                        ch = "  spot {:+.2f}{}".format(
-                            d_spot, "  flip {:+.2f}".format(d_flip) if d_flip is not None else "")
-                    print("{}  spot {:>9.2f}  flip {:>9}  walls {:>8}/{:<8} "
-                          "net {:>12}{}".format(
-                              now_et().strftime("%H:%M:%S"), sp, fmt_px(flip),
-                              fmt_px(w["call_wall"]), fmt_px(w["put_wall"]),
-                              fmt_bn(v["total"]), ch))
-                    prev = (sp, flip)
-                except Exception as e:
-                    print("{}  fetch failed: {}".format(
-                        now_et().strftime("%H:%M:%S"), str(e)[:70]))
-        except KeyboardInterrupt:
-            print("\nstopped.")
     return 0
 
 

@@ -232,7 +232,7 @@ def load_flow(path):
         return list(csv.DictReader(f))
 
 
-def report(ticker, flow_dir=FLOW_DIR, day=None, expiry=None, top=15, spot=None):
+def report(ticker, flow_dir=FLOW_DIR, day=None, expiry=None, top=15):
     """Aggregate a session's signed flow and derive the EMPIRICAL dealer sign."""
     path = flow_path(ticker, day, flow_dir)
     rows = load_flow(path)

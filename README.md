@@ -189,16 +189,16 @@ python3 gex.py --expiry 0dte         # single view
 python3 gex.py --expiry 2026-08-21   # a specific expiration
 python3 gex.py --expiry all --all-days 90        # widen the expiration window
 python3 gex.py --rate 0.0469 --div-yield 0.012   # override r and q
-python3 gex.py --convention flipped  # flip the dealer sign assumption
+python3 gex.py --put-sign 1          # flip the dealer put-sign assumption
 python3 gex.py --levels-only         # compact output (used by notifications)
 python3 gex.py --demo                # offline synthetic chain
 ```
 
 **Flags:** `--ticker` · `--expiry` · `--all-days` (default 45; wider risks a vendor 502) · `--rate` ·
 `--div-yield` (auto per-ticker if omitted) · `--multiplier` · `--price-range` (±10% flip window) ·
-`--steps` · `--convention` / `--call-sign` / `--put-sign` · `--x-tick` (chart gridlines, default 10) ·
-`--no-save-chain` / `--chain-dir` (chain archive; archiving is ON by default) · `--callback` ·
-`--no-plot` · `--out-prefix` · `--levels-only` · `--profiles` · `--watch N` · `--token-path` · `--demo`. Full list: `python3 gex.py --help`.
+`--steps` · `--put-sign` ·
+`--no-save-chain` / `--chain-dir` (chain archive; archiving is ON by default) ·
+`--no-plot` · `--out-prefix` · `--levels-only` · `--profiles` · `--token-path` · `--demo`. Full list: `python3 gex.py --help`.
 
 ### When to run what
 
@@ -263,7 +263,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-serve
 ## Scheduled push notifications
 
 `scripts/daily_gex.sh <cadence>` runs the tool for each ticker and pushes levels + charts to your phone via
-**ntfy**, **Pushover**, or **Telegram** (whichever credentials are in `.env`).
+**ntfy** (`NTFY_TOPIC` in `.env`).
 
 | Cadence | Schedule (CT / ET) | Window | Plist |
 |---|---|---|---|
@@ -289,38 +289,21 @@ Market holidays are not skipped — you get the prior session's levels.
 
 ---
 
-## Open-interest history & empirical dealer sign
+## Open-interest history
 
 Every live run archives the raw chain to `chains/<TICKER>/<date>.csv.gz` (OI is never backfillable, so an
-unsaved day is lost forever). `scripts/oi_history.py` turns that archive into two things a single snapshot
+unsaved day is lost forever). `scripts/oi_history.py` turns that archive into what a single snapshot
 cannot give you:
 
 ```bash
 python3 scripts/oi_history.py                          # archive inventory
 python3 scripts/oi_history.py --ticker SPY             # day-over-day dOI report
-python3 scripts/oi_history.py --ticker SPY --open-close cboe_oc.csv
 ```
 
 - **dOI report** — where positioning is *building* vs. stale OI that has sat for weeks. The crude aggressor
   lean (last print near ask → customers bought → dealers short that strike's gamma) is **graded by the
   opening ratio `dOI/volume`**: a high ratio means the day's flow mostly *opened* (trustworthy), a low ratio
   means mostly churn, so the lean is **suppressed as noise** instead of shown as false signal.
-- **Empirical dealer sign (`--open-close`)** — the model's `put_sign = -1` assumption is its biggest
-  weakness. CBOE Open-Close data splits volume into opening/closing × buy/sell × origin (customer / firm /
-  market-maker), so **net customer put buying ⇒ dealers short those puts**. Point it at a CBOE open-close
-  CSV and it reports the empirical dealer sign per strike and a verdict on whether the standard assumption
-  is **supported or fails** on that snapshot:
-
-  ```
-  PUT SIDE (the put_sign = -1 assumption under test):
-    put strikes with dealers SHORT: 2   LONG: 1
-    net customer put opening: +8,100 contracts
-    => customers NET-BOUGHT puts: dealers are net SHORT put gamma.
-       The standard put_sign = -1 assumption is SUPPORTED by this data.
-  ```
-
-  Caveat: CBOE captures only its own exchanges' share of volume (multi-listed options trade on up to 17
-  venues) — directionally informative, not the whole market.
 
 ---
 
@@ -365,7 +348,7 @@ Default (*standard*): dealers **long call gamma (+)**, **short put gamma (−)**
 net GEX = SUM_calls(GEX) - SUM_puts(GEX)
 ```
 
-Flippable via `--convention flipped` or `--call-sign` / `--put-sign`. Ground truth would require
+Flippable via `--put-sign`. Ground truth would require
 dealer-direction data (e.g. CBOE open-close), which this feed does not provide — so the tool quantifies its
 exposure to the assumption instead of pretending.
 
@@ -373,7 +356,7 @@ exposure to the assumption instead of pretending.
 
 Total net GEX is **repriced across a 1,000-point grid of hypothetical spot prices** (±10%), recomputing both
 `Γ(S')` **and** the `S'²` dollar term at each node. Each bracketed sign change is then refined to machine
-precision with **Brent's method** (the 0DTE curve is near-discontinuous, so linear interpolation across a
+precision by **bisection** (the 0DTE curve is near-discontinuous, so linear interpolation across a
 wide grid cell is a poor model).
 
 The curve can legitimately cross zero **more than once** — all crossings are detected, the nearest to spot
@@ -625,7 +608,6 @@ Also exposed as `implied_move` in `/api/gex` and shown on the iPhone app.
 
 ```bash
 python3 gex.py --ticker QQQ --profiles      # both layers, side by side
-python3 gex.py --ticker QQQ --watch 60      # recompute the intraday layer every 60s
 ```
 
 The same contract set answers two different questions, and conflating them is a modeling
@@ -667,12 +649,6 @@ expires. When they agree, the intraday flip is anchored by durable structure and
 confidence. (This is also the natural cross-check against an external regime model: the
 structural flip and your regime state should broadly agree, and divergence is worth a look.)
 
-**`--watch N`** re-fetches every N seconds and prints one line per tick with spot/flip/walls
-and the change since the last tick — because a level computed at 09:35 is not the level at 13:00:
-
-```
-17:44:21  spot 729.87  flip 730.28  walls 735.00/730.00  net -0.342 $Bn  spot +0.00  flip -0.00
-```
 
 ---
 
@@ -696,9 +672,9 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 ## Limitations (read before trading on this)
 
 - The **dealer sign convention is an assumption**, and the flip's *existence* depends on it. Biggest
-  weakness — treat the regime as directional context, not a precise tradeable level. It can now be **tested
-  empirically** against CBOE open-close data (`scripts/oi_history.py --open-close`), which reports whether
-  dealers are actually net short puts on a given day.
+  weakness — treat the regime as directional context, not a precise tradeable level. It can be **tested
+  empirically** with intraday signed flow (`flow.py --report`), which reports whether customers were net
+  buying or selling puts in a tracked session.
 - **OI is end-of-prior-session**; the intraday 0DTE picture is necessarily stale (flagged prominently on
   the 0DTE view).
 - **Single-underlying scope.** A full S&P dealer book aggregates SPX + SPXW + XSP + SPY + ES normalized to
@@ -721,7 +697,7 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 | `static/index.html` | Installable iOS PWA (levels) |
 | `static/setup.html` | Phone-based Schwab re-authentication |
 | `scripts/schwab_setup.py` | Terminal OAuth login + token validation + live verification |
-| `scripts/oi_history.py` | Chain-archive dOI analysis + CBOE open-close dealer-sign test |
+| `scripts/oi_history.py` | Chain-archive dOI analysis |
 | `scripts/token_audit.py` | Diagnoses early token expiry from the token journal |
 | `scripts/daily_gex.sh` | Multi-cadence notifier |
 | `scripts/*.plist` | 4 launchd agents (3 push cadences + API server) |
@@ -733,7 +709,7 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 ## Tests
 
 ```bash
-python3 -m pytest test_gex.py test_flow.py -v    # 74 tests, no network
+python3 -m pytest test_gex.py test_flow.py -v    # 70 tests, no network
 ```
 
 Validation is against **independently derived truth**, not recorded output:
@@ -749,12 +725,9 @@ Validation is against **independently derived truth**, not recorded output:
 - **Flip time-decay**: the close-of-day projection returns both the current and T-decayed flip, drops
   contracts that expire inside the window, and floors tiny `T` consistently with the live snapshot.
 - **0DTE staleness escalation**: the caveat fires on 0DTE views with a flip and never on other views.
-- **Empirical dealer sign**: open-close CSV parsing (flexible vendor column spellings), the
-  customer⇒dealer sign inversion, and the supported/fails verdict in both directions.
 - **Token persistence**: writes are atomic (a failed write leaves the previous token intact), the
   journal records rotation via fingerprints, and **raw refresh tokens never appear in the log**.
 - **Stale-client reload**: a token rotated by another process forces a rebuild before the next call —
   the fix for tokens dying in hours instead of days.
 - Plus: quote-filter behavior (including **wing preservation**), OpEx calendar arithmetic, retry
-  classification (transient vs. auth), cross-process token-lock exclusivity via a real subprocess, and
-  lock re-entrancy (nested acquisition must not deadlock against itself).
+  classification (transient vs. auth), and cross-process token-lock exclusivity via a real subprocess.
