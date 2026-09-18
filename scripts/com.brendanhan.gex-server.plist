@@ -16,12 +16,12 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/anaconda3/bin/python</string>
-        <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/server.py</string>
+        <string>/Users/brendanhan/vault/raw/repos/.venv/bin/python</string>
+        <string>/Users/brendanhan/vault/raw/repos/gamma_exposure/server.py</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure</string>
+    <string>/Users/brendanhan/vault/raw/repos/gamma_exposure</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -29,8 +29,8 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/logs/server.log</string>
+    <string>/Users/brendanhan/vault/raw/repos/gamma_exposure/logs/server.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure/logs/server.log</string>
+    <string>/Users/brendanhan/vault/raw/repos/gamma_exposure/logs/server.log</string>
 </dict>
 </plist>

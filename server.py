@@ -19,8 +19,8 @@ Endpoints:
 Notes:
   * Results are cached for CACHE_TTL_S per (ticker, expiry, window) so pull-to-
     refresh doesn't hammer Schwab. `cached: true` marks a cache hit.
-  * On an auth error the cached Schwab client is dropped, so after you re-run
-    scripts/schwab_setup.py the server heals on the next request -- no restart.
+  * The hub owns the token: after `../schwab_hub/run.sh login` (or /setup.html) the
+    server works on the next request -- no restart.
   * Binds 0.0.0.0: reachable on your LAN only (behind the router). No account
     actions are possible through this API; it reads market data and computes.
 """
@@ -95,22 +95,11 @@ def _fetch_bounded(client, symbol, **kw):
 
 
 def _get_client():
-    """Return a Schwab client built from the CURRENT token file.
-
-    Critical: this server is long-lived, so a cached client can outlive the token
-    it was built from (a re-login rewrites the file). Presenting a superseded
-    refresh token makes Schwab revoke the whole family -- observed live: a server
-    started Jul 23 killed an Aug 2 login within a day. So we rebuild whenever the
-    token file changes on disk instead of caching forever.
-    """
+    """The hub client (stateless: the hub owns the token, so nothing here can go stale)."""
     global _client
     with _lock:
-        if _client is not None:
-            _client = gex.reload_client_if_stale(_client)
-        else:
-            _client = gex.get_schwab_client(
-                os.environ.get("SCHWAB_APP_KEY"), os.environ.get("SCHWAB_APP_SECRET"),
-                os.environ.get("SCHWAB_TOKEN_PATH", gex.DEFAULT_TOKEN_PATH))
+        if _client is None:
+            _client = gex.get_schwab_client()
         return _client
 
 
@@ -134,26 +123,23 @@ def _note_auth(ok, code=None):
 def _classify(exc):
     """Map an exception to (http_status, code, user_message)."""
     s = str(exc).lower()
-    if "oauth" in type(exc).__name__.lower() or "token" in s:
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 401 or "oauth" in type(exc).__name__.lower() or "token" in s:
         return 503, "schwab_token_expired", \
-            "Schwab token expired. On the Mac run: python3 scripts/schwab_setup.py"
+            "Schwab token expired. Run: ../schwab_hub/run.sh login"
     if "timed out" in s or "connection" in s or "reset" in s:
         return 502, "schwab_unreachable", "Schwab API unreachable (transient); retry shortly."
     return 500, "internal_error", str(exc)[:200]
 
 
 def _token_health():
-    path = os.environ.get("SCHWAB_TOKEN_PATH", gex.DEFAULT_TOKEN_PATH)
-    out = {"token_present": os.path.exists(path), "token_age_days": None,
-           "token_days_left": None}
+    """Token state as reported by the hub (the only holder of the token)."""
+    out = {"token_present": False, "token_age_days": None, "token_days_left": None}
     try:
-        import json
-        with open(path) as f:
-            ct = json.load(f).get("creation_timestamp")
-        if ct:
-            age = (time.time() - ct) / 86400.0
-            out["token_age_days"] = round(age, 2)
-            out["token_days_left"] = round(max(0.0, 7.0 - age), 2)
+        import requests
+        h = requests.get(_get_client().url + "/health", timeout=3).json()
+        out.update(token_present=bool(h.get("ok")), token_age_days=h.get("token_age_days"),
+                   token_days_left=h.get("relogin_in_days"))
     except Exception:
         pass
     return out
@@ -165,97 +151,48 @@ def health():
     h["auth_error"] = _auth_error
     h["ok"] = bool(h["token_present"] and (h["token_days_left"] or 0) > 0
                    and _auth_error is None)
-    h["message"] = ("Schwab token rejected -- run scripts/schwab_setup.py"
+    h["message"] = ("Schwab token rejected -- run ../schwab_hub/run.sh login"
                     if _auth_error == "schwab_token_expired" else None)
     h["now_et"] = gex.now_et().isoformat()
     return h
 
 
 # ---------------------------------------------------------------------------
-# Phone-based re-authentication (/setup)
+# Phone-based re-authentication (/setup) -- proxied to the central schwab_hub
 # ---------------------------------------------------------------------------
-# Schwab refresh tokens are hard-capped at 7 days with no programmatic renewal,
-# so re-login is permanent and weekly. These endpoints move that chore off the
-# terminal: approve on the phone, paste the redirect URL, done -- from anywhere.
-# The app secret never leaves the server; the browser only ever handles the
-# short-lived authorization code, exactly as in the CLI flow.
-_auth_ctx = {}                  # state -> AuthContext (pending logins)
+# Schwab refresh tokens are hard-capped at 7 days, so re-login is weekly. The hub
+# owns the token and runs the OAuth exchange (the app secret never leaves it);
+# this server only relays, so the phone flow at /setup.html keeps working.
+def _hub(method, path, **kw):
+    import requests
+    try:
+        r = requests.request(method, _get_client().url + path, timeout=30, **kw)
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail={
+            "code": "hub_unreachable", "message": "schwab_hub is not running: start ../schwab_hub/run.sh"})
+    try:
+        body = r.json()
+    except ValueError:
+        body = {}
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail={
+            "code": body.get("error", "hub_error"), "message": body.get("detail", r.text[:200])})
+    return body
 
 
 @app.get("/api/auth/start")
 def auth_start():
-    key = os.environ.get("SCHWAB_APP_KEY")
-    if not key:
-        raise HTTPException(status_code=500, detail={
-            "code": "no_credentials", "message": "SCHWAB_APP_KEY not set on the server."})
-    try:
-        from schwab.auth import get_auth_context
-    except ImportError:
-        raise HTTPException(status_code=500, detail={
-            "code": "no_schwab_py", "message": "schwab-py not installed on the server."})
-    callback = os.environ.get("SCHWAB_CALLBACK_URL", gex.DEFAULT_CALLBACK)
-    ctx = get_auth_context(key, callback)
-    _auth_ctx.clear()                       # only one pending login at a time
-    _auth_ctx[ctx.state] = ctx
-    return {"authorize_url": ctx.authorization_url, "state": ctx.state,
-            "callback": callback}
+    return _hub("GET", "/auth/start")
 
 
 @app.post("/api/auth/complete")
 async def auth_complete(payload: dict):
-    """Exchange the pasted redirect URL for a token and write it to disk."""
-    received = (payload or {}).get("redirect_url", "").strip()
-    if "code=" not in received:
-        raise HTTPException(status_code=422, detail={
-            "code": "bad_redirect",
-            "message": "That URL has no 'code=' in it. Copy the FULL address bar "
-                       "contents after approving."})
-    if not _auth_ctx:
-        raise HTTPException(status_code=409, detail={
-            "code": "no_pending_login",
-            "message": "No login in progress. Tap 'Start login' again."})
-    key = os.environ.get("SCHWAB_APP_KEY")
-    secret = os.environ.get("SCHWAB_APP_SECRET")
-    token_path = os.environ.get("SCHWAB_TOKEN_PATH", gex.DEFAULT_TOKEN_PATH)
-    ctx = list(_auth_ctx.values())[0]       # the context that minted this URL
-    try:
-        import schwab.auth as sa
-        writer = getattr(sa, "_" + "_make_update_token_func")(token_path)
-        # Serialize against any in-flight API call: a fresh login invalidates the
-        # old family, and a concurrent call presenting the OLD token would revoke
-        # the NEW one moments after it is created.
-        with gex.token_lock(token_path):
-            sa.client_from_received_url(key, secret, ctx, received, writer)
-    except Exception as e:
-        msg = str(e)
-        if "state" in msg.lower():
-            msg = ("State mismatch -- that redirect came from an older attempt. "
-                   "Tap 'Start login' and use only the newest link.")
-        raise HTTPException(status_code=400, detail={"code": "exchange_failed",
-                                                     "message": msg[:240]})
-    _auth_ctx.clear()
-
-    # Validate what was written: a token with no refresh_token dies in 30 min and
-    # can never renew -- catch it now, not at tomorrow's 07:45 run.
-    try:
-        import json as _json
-        with open(token_path) as f:
-            tok = (_json.load(f).get("token") or {})
-        if not tok.get("refresh_token"):
-            raise HTTPException(status_code=400, detail={
-                "code": "bad_token",
-                "message": "Login wrote a token with no refresh token. Try again."})
-    except HTTPException:
-        raise
-    except Exception:
-        pass
-
-    _drop_client()                          # force a rebuild from the new token
+    """Relay the pasted redirect URL to the hub, which exchanges it for a token."""
+    body = _hub("POST", "/auth/complete", json={"redirect_url": (payload or {}).get("redirect_url", "")})
     _note_auth(True)
     _exp_cache.clear()
     _gex_cache.clear()
-    h = _token_health()
-    return {"ok": True, "token_days_left": h.get("token_days_left"),
+    return {"ok": True, "token_days_left": body.get("relogin_in_days"),
             "message": "Token installed. Levels are live again."}
 
 
@@ -350,11 +287,15 @@ def api_gex(ticker: str = Query("SPY", max_length=8),
 
     if exp not in ("both", "0dte", "all"):
         try:
-            date.fromisoformat(exp)
+            exp_d = date.fromisoformat(exp)
         except ValueError:
             raise HTTPException(status_code=422, detail={
                 "code": "bad_expiry",
                 "message": "expiry must be 'both', '0dte', 'all', or YYYY-MM-DD"})
+        if exp_d < today:   # Schwab 400s on a past fromDate
+            raise HTTPException(status_code=422, detail={
+                "code": "bad_expiry",
+                "message": "expiry {} is in the past; those contracts have settled.".format(exp)})
 
     # fresh=1 bypasses the cache entirely: the phone's "GET FRESH LEVELS" button
     # must re-pull spot/IV from Schwab, never replay a 60s-old snapshot.

@@ -120,12 +120,14 @@ thin early-morning chains are handled by dropping contracts with no OI / no IV
 (and crossed quotes) and reporting the counts.
 
 Setup (one time):
-    export SCHWAB_APP_KEY=...  SCHWAB_APP_SECRET=...   # from developer.schwab.com
-    python3 scripts/schwab_setup.py                    # schwab-py OAuth login + verify
+    ../schwab_hub/run.sh login                         # Schwab login, weekly (hub owns the token)
+    ../schwab_hub/run.sh                               # leave the hub running
+    python3 scripts/schwab_setup.py                    # verify the live chain path
 
 Usage:
     python3 gex.py                 # 0DTE + all expiries, SPY (default)
     python3 gex.py --expiry 0dte
+    python3 gex.py --expiry week      # pool all expiries in the current Mon-Fri week
     python3 gex.py --expiry 2026-06-19 --rate 0.0469
     python3 gex.py --ticker QQQ    # any optionable ETF/equity with listed OI
     python3 gex.py --demo          # offline synthetic chain, no credentials
@@ -142,12 +144,10 @@ import warnings
 warnings.filterwarnings("ignore", message=r".*OpenSSL.*", module="urllib3")
 
 import argparse
-import fcntl
 import math
 import os
 import sys
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -157,11 +157,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Defaults / tunables  (ALL are surfaced in the printed assumptions block)
 # ---------------------------------------------------------------------------
-# --- Charles Schwab Trader API (data source; auth via the schwab-py library) ---
-# OAuth + token refresh are handled by schwab-py (see scripts/schwab_setup.py),
-# mirroring the sibling overnight_vs_intraday project's setup.
-DEFAULT_CALLBACK   = "https://127.0.0.1:8182"   # must EXACTLY match your Schwab app's callback
-DEFAULT_TOKEN_PATH = ".schwab_token.json"        # project-local token file (git-ignored)
+# --- Charles Schwab Trader API (data source; auth lives in the central schwab_hub) ---
 
 DEFAULT_TICKER       = "SPY"      # SPY, not SPX: Schwab returns ZERO open interest
                                   # for cash-index ($SPX) options, and GEX is
@@ -777,17 +773,11 @@ def enrich_and_filter_time(contracts, now):
 
 
 # ===========================================================================
-# Charles Schwab Trader API -- Market Data (option chains) via schwab-py
+# Charles Schwab Trader API -- Market Data (option chains) via the schwab_hub
 # ===========================================================================
-# Auth + token refresh are delegated to the schwab-py library (mirrors the
-# sibling overnight_vs_intraday project):
-#   * Register an app at developer.schwab.com -> App Key + App Secret (from env
-#     SCHWAB_APP_KEY / SCHWAB_APP_SECRET; NEVER hardcoded), callback :8182.
-#   * Run `python3 scripts/schwab_setup.py` ONCE to log in via browser and write
-#     the token file (.schwab_token.json); refresh tokens last ~7 days.
-#   * schwab-py needs Python >= 3.10, so its import is LAZY -- --demo and the unit
-#     tests still run on 3.9. One get_option_chain() call returns the whole chain
-#     plus the underlying spot, OI and IV; Schwab market data is free.
+# The hub (../schwab_hub/run.sh) owns the app credentials and the single token, so
+# nothing here logs in or refreshes. One get_option_chain() call returns the whole
+# chain plus the underlying spot, OI and IV; Schwab market data is free.
 
 SCHWAB_INDEX_SYMBOLS = {  # cash indices take a "$" prefix on Schwab
     "SPX": "$SPX", "NDX": "$NDX", "RUT": "$RUT", "VIX": "$VIX", "DJI": "$DJI",
@@ -835,201 +825,20 @@ def to_schwab_symbol(ticker):
     return SCHWAB_INDEX_SYMBOLS.get(t, t)
 
 
-# ---------------------------------------------------------------------------
-# Token sharing safety (multi-process)
-# ---------------------------------------------------------------------------
-# Schwab ROTATES the refresh token on every refresh and treats presentation of a
-# superseded refresh token as a compromise -> it revokes the whole token family.
-# This project has several processes sharing ONE token file (the always-on
-# server, the launchd push jobs, manual CLI runs), which creates two hazards:
-#
-#   1. STALE IN-MEMORY TOKEN: a long-lived process (server.py) caches a client
-#      built from the token file. After any other login/refresh rewrites that
-#      file, the cached client still holds the OLD refresh token; the next time
-#      it refreshes it presents a superseded token and kills the new one too.
-#      -> Fix: reload_client_if_stale() notices the file changed and
-#         rebuilds. (Observed live: a server started Jul 23 revoked an Aug 2 login.)
-#
-#   2. CONCURRENT REFRESH: two processes refreshing at once each rotate the
-#      token, invalidating the other's. -> Fix: token_lock() serializes API calls
-#      across processes via an flock on a sidecar .lock file.
-def _token_mtime(path):
-    try:
-        return os.path.getmtime(path)
-    except OSError:
-        return None
+def get_schwab_client(app_key=None, app_secret=None, token_path=None):
+    """Client for Schwab market data, served by the central schwab_hub.
 
-
-# ---------------------------------------------------------------------------
-# Token forensics + atomic persistence
-# ---------------------------------------------------------------------------
-# Tokens have been dying within hours instead of the documented 7 days, with no
-# process visibly running. Rather than keep guessing, every token READ and WRITE
-# is journaled with the PID, the command line, and a FINGERPRINT of the refresh
-# token (sha256 prefix -- identifies rotation without storing any secret). When
-# the next failure happens, scripts/token_audit.py names the culprit instead of
-# leaving it to speculation.
-#
-# The write is also made ATOMIC (temp file + os.replace). schwab-py's default
-# writer opens the token path with mode 'w', which TRUNCATES before writing: a
-# crash, a kill, or two overlapping writers can leave a truncated or interleaved
-# token file, which Schwab then rejects. os.replace is atomic on POSIX, so a
-# reader always sees either the old token or the new one -- never a half-written
-# one. This closes a real failure mode, independent of the diagnostics.
-TOKEN_AUDIT_LOG = os.path.join("logs", "token_audit.log")
-
-
-def _token_fingerprint(tok):
-    """Short, non-reversible id for a refresh token, so rotation is visible."""
-    import hashlib
-    if isinstance(tok, dict):
-        tok = (tok.get("token") or tok).get("refresh_token") or ""
-    if not tok:
-        return "none"
-    return hashlib.sha256(tok.encode()).hexdigest()[:10]
-
-
-def token_audit(event, path, payload=None, note=""):
-    """Append one forensic line. Never raises -- diagnostics must not break runs."""
-    try:
-        os.makedirs(os.path.dirname(TOKEN_AUDIT_LOG) or ".", exist_ok=True)
-        cmd = " ".join(os.path.basename(a) for a in sys.argv[:3])
-        exp = ""
-        if isinstance(payload, dict):
-            t = payload.get("token") or payload
-            if t.get("expires_at"):
-                exp = datetime.fromtimestamp(float(t["expires_at"])).strftime("%H:%M:%S")
-        with open(TOKEN_AUDIT_LOG, "a") as f:
-            f.write("{} pid={:<7} {:<6} rt={} acc_exp={:<9} {} [{}]\n".format(
-                now_et().strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), event,
-                _token_fingerprint(payload), exp or "-", note, cmd[:60]))
-    except Exception:
-        pass
-
-
-def _token_reader(path):
-    def read():
-        import json
-        with open(path) as f:
-            d = json.load(f)
-        token_audit("READ", path, d)
-        return d
-    return read
-
-
-def _token_writer(path):
-    def write(t, *args, **kwargs):
-        import json
-        import tempfile
-        token_audit("WRITE", path, t, note="rotated")
-        d = os.path.dirname(os.path.abspath(path)) or "."
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".schwab_tok", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(t, f)
-                f.flush()
-                os.fsync(f.fileno())          # durable before the swap
-            os.replace(tmp, path)             # atomic on POSIX
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    return write
-
-
-@contextmanager
-def token_lock(token_path, timeout=120.0, poll=0.25):
-    """Cross-process exclusive lock guarding Schwab API calls (refresh rotation).
-
-    Uses a sidecar '<token>.lock' file so the token itself is never truncated.
-    On timeout it proceeds UNLOCKED rather than failing the run: a possible race
-    is better than a guaranteed outage. NOT re-entrant: flock is per-fd, so a
-    nested acquire blocks against the outer one until the timeout.
+    The hub owns the credentials and the single token, so the arguments are ignored
+    (kept so existing call sites still work). Raises RuntimeError if the client
+    package is missing: `pip install -e ../schwab_hub`.
     """
-    if not token_path:
-        yield
-        return
-    with open(token_path + ".lock", "a+") as fh:
-        deadline = time.time() + timeout
-        while True:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if time.time() >= deadline:
-                    break
-                time.sleep(poll)
-        yield          # closing fh releases the flock
-
-
-def get_schwab_client(app_key, app_secret, token_path):
-    """Build a schwab-py client from a cached token file.
-
-    OAuth and token refresh are delegated to schwab-py (the token is written by
-    scripts/schwab_setup.py). Raises a clear RuntimeError if the credentials or
-    token file are missing, or if schwab-py isn't installed. The ``schwab`` import
-    is LAZY so the rest of the tool -- and the unit tests -- run on Python 3.9,
-    where schwab-py (which needs >= 3.10) cannot be installed.
-    """
-    if not (app_key and app_secret):
-        raise RuntimeError(
-            "SCHWAB_APP_KEY / SCHWAB_APP_SECRET not set. Register a Market Data app "
-            "on developer.schwab.com and export the credentials.")
-    if not os.path.exists(token_path):
-        raise RuntimeError(
-            "No Schwab token at {!r}. Run the one-time login first:\n"
-            "    python3 scripts/schwab_setup.py\n"
-            "(refresh tokens expire after ~7 days, so re-run weekly).".format(token_path))
     try:
-        from schwab.auth import client_from_access_functions
+        from schwab_hub_client import HubClient
     except ImportError as exc:
         raise RuntimeError(
-            "schwab-py is required for live data: pip install 'schwab-py>=1.3' "
-            "(needs Python >= 3.10).") from exc
-    # Equivalent to client_from_token_file, but with OUR read/write functions so
-    # every token touch is journaled and every write is atomic (see above).
-    client = client_from_access_functions(
-        app_key, app_secret, _token_reader(token_path), _token_writer(token_path))
-    # Explicit HTTP timeout: without it a dying connection can hang for minutes
-    # (observed ~8 min/ticker in scheduled runs). Guarded: older schwab-py only.
-    try:
-        client.set_timeout(30.0)
-    except Exception:
-        pass
-    # Stamp the source file + its mtime so holders can detect a rewritten token
-    # (see reload_client_if_stale) instead of presenting a superseded refresh token.
-    client._gex_token_path = token_path
-    client._gex_token_mtime = _token_mtime(token_path)
-    client._gex_app_key = app_key            # kept so the client can be REBUILT
-    client._gex_app_secret = app_secret      # from disk when the token rotates
-    return client
-
-
-def reload_client_if_stale(client):
-    """Return a client built from the CURRENT on-disk token, rebuilding if needed.
-
-    MUST be called while holding token_lock, immediately before an API call.
-    Checking staleness earlier is a check-then-act race: between building a
-    client and acquiring the lock, another process can refresh and rotate the
-    refresh token, after which this client holds a SUPERSEDED token. Presenting
-    it makes Schwab revoke the entire token family -- observed live: a token
-    minted at 10:11 was dead by 11:29 with no process running in between.
-    """
-    path = getattr(client, "_gex_token_path", None)
-    if not path:
-        return client
-    if _token_mtime(path) == getattr(client, "_gex_token_mtime", None):
-        return client                        # unchanged on disk -> safe to use
-    key = getattr(client, "_gex_app_key", None)
-    sec = getattr(client, "_gex_app_secret", None)
-    if not (key and sec):
-        return client
-    try:
-        return get_schwab_client(key, sec, path)
-    except Exception:
-        return client                        # never break a run over a reload
+            "schwab_hub_client is required for live data: pip install -e ../schwab_hub "
+            "(and start the hub with ../schwab_hub/run.sh).") from exc
+    return HubClient()
 
 
 def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_count=None,
@@ -1044,20 +853,14 @@ def fetch_chain_schwab(client, symbol, from_date=None, to_date=None, strike_coun
     `max_retries` times with linear backoff -- scheduled morning runs were dying
     on single network hiccups. NON-transient failures (4xx, OAuth/auth errors)
     are raised immediately: retrying an expired refresh token cannot help, only
-    a re-login can (scripts/schwab_setup.py).
+    a re-login can (../schwab_hub/run.sh login).
     """
     kwargs = {"include_underlying_quote": True, "from_date": from_date,
               "to_date": to_date, "strike_count": strike_count}
     last = None
-    tok_path = getattr(client, "_gex_token_path", None)
     for attempt in range(max_retries):
         try:
-            # Serialized across processes: a refresh triggered inside this call
-            # rotates the shared refresh token (see token_lock). The staleness
-            # re-check must happen INSIDE the lock -- see reload_client_if_stale.
-            with token_lock(tok_path):
-                client = reload_client_if_stale(client)
-                resp = client.get_option_chain(symbol, **kwargs)
+            resp = client.get_option_chain(symbol, **kwargs)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -1259,9 +1062,7 @@ def fetch_spx_spy_ratio(client, base_ticker, spot):
     """
     other = "SPY" if base_ticker == "SPX" else "$SPX"
     try:
-        with token_lock(getattr(client, "_gex_token_path", None)):
-            client = reload_client_if_stale(client)
-            resp = client.get_quote(other)
+        resp = client.get_quote(other)
         resp.raise_for_status()
         q = ((resp.json().get(other) or {}).get("quote")) or {}
         px = q.get("lastPrice") or q.get("mark") or q.get("closePrice")
@@ -1787,7 +1588,9 @@ def parse_args(argv=None):
                         "cash indices ($SPX etc.), so index GEX is impossible here -- use "
                         "the ETF (SPY/QQQ).")
     p.add_argument("--expiry", default=None,
-                   help="'0dte' | 'all' | YYYY-MM-DD. Default: compute BOTH 0DTE and all expiries.")
+                   help="'0dte' | 'week' | 'all' | YYYY-MM-DD. 'week' pools all expiries in the "
+                        "current Mon-Fri trading week (next week's if run on a weekend). "
+                        "Default: compute BOTH 0DTE and all expiries.")
     p.add_argument("--rate", type=float, default=DEFAULT_RATE, help="risk-free rate (annual, decimal).")
     p.add_argument("--div-yield", type=float, default=None,
                    help="dividend yield (annual, decimal). Default: built-in per-ticker map "
@@ -1802,9 +1605,10 @@ def parse_args(argv=None):
                         "year of SPX); raise it for more coverage at the risk of a 502.")
     p.add_argument("--out-prefix", default=None, help="output chart filename prefix.")
     p.add_argument("--no-plot", action="store_true", help="skip chart generation.")
-    p.add_argument("--token-path", default=None,
-                   help="Schwab token file (default .schwab_token.json or $SCHWAB_TOKEN_PATH). "
-                        "Create it with: python3 scripts/schwab_setup.py")
+    p.add_argument("--expiry-risk", nargs="?", const="auto", default=None, metavar="DATE",
+                   help="gamma roll-off (profile with and WITHOUT contracts expiring through "
+                        "DATE), charm/vanna hedging flow into the close, and pin candidates. "
+                        "DATE defaults to this week's Friday.")
     p.add_argument("--profiles", action="store_true",
                    help="show the INTRADAY (front-week + next OpEx, OI blended with "
                         "today's volume) and STRUCTURAL (all expiries, OI only) profiles.")
@@ -2070,6 +1874,259 @@ def print_hedging_flow(view, spot, cfg, spy_ratio=None, venues=("ES", "SPY")):
     return True
 
 
+# ---------------------------------------------------------------------------
+# Expiry mechanics: roll-off, charm/vanna into the close, pinning
+# ---------------------------------------------------------------------------
+def is_quarterly_opex(d):
+    """Third Friday of Mar/Jun/Sep/Dec -- triple witching."""
+    return d.month in (3, 6, 9, 12) and d == third_friday(d.year, d.month)
+
+
+def expiry_mechanics(day, ticker="SPY"):
+    """Settlement / rebalance gotchas for an expiration date, as warning lines.
+
+    These are mechanical facts about the session, not model output -- they say
+    when the tape itself will misbehave in ways that break the tool's own
+    assumptions (notably flow classification).
+    """
+    out = []
+    base = ticker.upper().lstrip("$")
+    if is_quarterly_opex(day):
+        out.append("QUARTERLY OpEx {} (triple witching).".format(day))
+        out.append("  AM vs PM settlement: SPX quarterlies settle on the Friday OPENING "
+                   "print (SET), built from each component's opening trade -- SET can "
+                   "differ materially from the SPX open drawn on a chart. {} is "
+                   "PM-settled at 16:00, so the two books die at OPPOSITE ends of the "
+                   "same session.".format(base))
+        out.append("  S&P quarterly rebalance prints at that Friday's CLOSE: expect an "
+                   "outsized MOC imbalance and a volume spike. Volume-profile and the "
+                   "flow.py aggressor classification are unreliable that session.")
+    elif day == third_friday(day.year, day.month):
+        out.append("MONTHLY OpEx {}: the bulk of index OI rolls off here; {} is "
+                   "PM-settled at 16:00.".format(day, base))
+    return out
+
+
+def rolloff_cutoff(contracts, today):
+    """Default roll-off cutoff: this week's Friday, else the nearest expiry."""
+    friday = week_bounds(today)[1]
+    if any(c.expiry <= friday for c in contracts):
+        return friday
+    future = sorted({c.expiry for c in contracts})
+    return future[0] if future else friday
+
+
+def gamma_rolloff(contracts, spot, cfg, cutoff, now=None):
+    """The board BEFORE and AFTER everything through `cutoff` expires.
+
+    A board pinned by positive gamma today can flip negative with no price
+    change at all, purely because the gamma holding it there expired. The
+    post-expiry profile is the one that describes next week.
+    """
+    survivors = [c for c in contracts if c.expiry > cutoff]
+    expiring = [c for c in contracts if c.expiry <= cutoff]
+    if not contracts:
+        return None
+    before = compute_view(contracts, spot, cfg, now=now)
+    after = compute_view(survivors, spot, cfg, now=now) if survivors else {"empty": True, "n": 0}
+    gross_all = gross_dollar_gamma(contracts, spot, cfg)
+    return {
+        "cutoff": cutoff, "before": before, "after": after,
+        "n_expiring": len(expiring), "n_surviving": len(survivors),
+        "expiring_share": (gross_dollar_gamma(expiring, spot, cfg) / gross_all
+                           if gross_all > 0 else None),
+    }
+
+
+def dealer_delta_shares(contracts, spot, cfg, iv_shift=0.0):
+    """Aggregate dealer delta, in SHARES of the underlying.
+
+    delta_call = e^{-qT} N(d1);  delta_put = e^{-qT} (N(d1) - 1), signed by the
+    dealer convention and scaled by size * multiplier. Scalar loop on purpose:
+    this runs a handful of times per report, not inside the 1000-node flip grid.
+    """
+    total = 0.0
+    r, q, mult = cfg.rate, cfg.div_yield, cfg.multiplier
+    for c in contracts:
+        sigma = c.iv + iv_shift
+        if c.T <= 0 or sigma <= 0 or spot <= 0 or c.strike <= 0:
+            continue
+        vt = sigma * math.sqrt(c.T)
+        d1 = (math.log(spot / c.strike) + (r - q + 0.5 * sigma ** 2) * c.T) / vt
+        dfq = math.exp(-q * c.T)
+        delta = dfq * _norm_cdf(d1) if c.cp == "call" else dfq * (_norm_cdf(d1) - 1.0)
+        sign = cfg.convention.call_sign if c.cp == "call" else cfg.convention.put_sign
+        size = c.oi if c.size is None else c.size
+        total += sign * delta * size * mult
+    return total
+
+
+def charm_vanna_flow(contracts, spot, cfg, now=None):
+    """Mechanical hedging flow into the 16:00 close, holding SPOT FIXED.
+
+    Charm is the delta decay itself: as strikes resolve toward 0 or 1 delta the
+    dealer book's delta moves even if price does not, and the hedge has to move
+    with it. Dealers hold -D against a book delta of D, so when the book goes
+    D -> D' they must TRADE -(D' - D) shares. Positive = they must buy.
+
+    This is measured by repricing at the decayed T (the same trick as the flip
+    projection), not from a charm closed form -- one code path, one set of
+    assumptions. Vanna is the same question asked of a +1 vol point shift.
+    """
+    now = now_et() if now is None else now
+    secs = seconds_to_expiry(now.date(), now)
+    if secs <= 0 or not contracts:
+        return None
+    d_now = dealer_delta_shares(contracts, spot, cfg)
+    # Decay to JUST BEFORE the bell (T_FLOOR), not through it. _decayed_contracts
+    # DROPS anything that reaches expiry, and counting a vanished contract's whole
+    # delta as flow would be wrong: at settlement that delta is extinguished by
+    # exercise/assignment, not traded on the tape. What does hit the tape is the
+    # migration of deltas toward 0/1 while the contracts are still alive.
+    decayed = _decayed_contracts(contracts, max(0.0, secs - T_FLOOR_SECONDS))
+    d_close = dealer_delta_shares(decayed, spot, cfg) if decayed else 0.0
+    return {
+        "seconds": secs,
+        "delta_now": d_now,
+        "delta_close": d_close,
+        "charm_shares": -(d_close - d_now),
+        "vanna_shares": -(dealer_delta_shares(contracts, spot, cfg, iv_shift=0.01) - d_now),
+        "n_expiring_today": sum(1 for c in contracts if c.expiry == now.date()),
+    }
+
+
+def pin_candidates(contracts, spot, cfg, day, top=5):
+    """Strikes with the largest dealer gamma CONCENTRATION expiring on `day`.
+
+    Ranked by raw gross dollar gamma per strike -- not max pain, and no
+    proximity fudge factor. Distance from spot is reported so you can judge
+    reachability yourself.
+    """
+    same_day = [c for c in contracts if c.expiry == day]
+    if not same_day:
+        return []
+    prof = compute_gex_profile(same_day, spot, cfg.convention, cfg)
+    rows = []
+    for i, K in enumerate(prof["strikes"]):
+        gross = abs(float(prof["call_gex"][i])) + abs(float(prof["put_gex"][i]))
+        if gross > 0:
+            rows.append({"strike": float(K), "gross": gross,
+                         "net": float(prof["net"][i]),
+                         "dist_pct": (float(K) - spot) / spot})
+    rows.sort(key=lambda r: -r["gross"])
+    return rows[:top]
+
+
+def print_expiry_risk(all_contracts, spot, cfg, today, spy_ratio=None,
+                      cutoff=None, now=None, oi_date=None):
+    """Roll-off + charm/vanna + pinning, i.e. what changes when contracts die."""
+    now = now_et() if now is None else now
+    cutoff = cutoff or rolloff_cutoff(all_contracts, today)
+
+    print("=" * 78)
+    print("EXPIRY RISK   (roll-off through {} / charm into the close / pinning)"
+          .format(cutoff))
+    print("=" * 78)
+    for line in expiry_mechanics(cutoff, cfg.ticker):
+        print("  ** " + line)
+    if is_quarterly_opex(cutoff) or cutoff == third_friday(cutoff.year, cutoff.month):
+        print()
+
+    # ---- 1. gamma roll-off ----------------------------------------------
+    ro = gamma_rolloff(all_contracts, spot, cfg, cutoff, now=now)
+    if ro:
+        b, a = ro["before"], ro["after"]
+        print("  GAMMA ROLL-OFF   what the board looks like once {} expires".format(cutoff))
+        print("  {:<22}{:>18}{:>18}".format("", "NOW", "POST-EXPIRY"))
+        print("  {:<22}{:>18}{:>18}".format(
+            "contracts", b.get("n", 0), a.get("n", 0)))
+        if not a.get("empty"):
+            print("  {:<22}{:>18}{:>18}".format(
+                "net GEX", fmt_bn(b["total"]), fmt_bn(a["total"])))
+            print("  {:<22}{:>18}{:>18}".format(
+                "gross |gamma|", fmt_bn(b["gross"]), fmt_bn(a["gross"])))
+            fb, fa = b["flip_std"]["flip"], a["flip_std"]["flip"]
+            print("  {:<22}{:>18}{:>18}".format("flip", fmt_px(fb), fmt_px(fa)))
+            print("  {:<22}{:>18}{:>18}".format(
+                "regime at spot", regime_word(spot, fb), regime_word(spot, fa)))
+            print("  {:<22}{:>18}{:>18}".format(
+                "call wall", fmt_px(b["walls"]["call_wall"]), fmt_px(a["walls"]["call_wall"])))
+            print("  {:<22}{:>18}{:>18}".format(
+                "put wall", fmt_px(b["walls"]["put_wall"]), fmt_px(a["walls"]["put_wall"])))
+            if ro["expiring_share"] is not None:
+                print("\n  {:.0%} of gross gamma expires at {}.".format(
+                    ro["expiring_share"], cutoff))
+            # The headline: does the REGIME survive the expiry?
+            if fb is not None and fa is not None:
+                d = fa - fb
+                print("  Flip moves {:+.2f} ({:+.2f}% of spot) on expiry alone -- no price "
+                      "change required.".format(d, d / spot * 100))
+                if (spot > fb) != (spot > fa):
+                    print("  *** REGIME FLIPS ON EXPIRY: {} today -> {} after, at an "
+                          "unchanged spot.".format(regime_word(spot, fb), regime_word(spot, fa)))
+                elif abs(spot - fa) < abs(spot - fb):
+                    print("  Flip moves TOWARD spot: the gamma holding this level is the "
+                          "gamma that dies.")
+        else:
+            print("  (nothing survives {} in the fetched window -- widen --all-days)"
+                  .format(cutoff))
+        print()
+
+    # ---- 2. charm / vanna into the close ---------------------------------
+    cv = charm_vanna_flow(all_contracts, spot, cfg, now=now)
+    if cv:
+        hrs = cv["seconds"] / 3600.0
+        mult, _lbl, _adv = HEDGE_VENUES["ES"]
+        eq = cross_quote(cfg.ticker, spot, spy_ratio) if spy_ratio else None
+        idx = eq[1] if (eq and eq[0] == "SPX") else spot
+        es = abs(cv["charm_shares"]) * spot / (mult * idx)
+        print("  CHARM INTO THE CLOSE   ({:.1f}h left; spot held FIXED)".format(hrs))
+        print("  dealer delta now ....... {:>16,.0f} shares".format(cv["delta_now"]))
+        print("  dealer delta at close .. {:>16,.0f} shares".format(cv["delta_close"]))
+        print("  -> mechanical hedge .... {:>16,.0f} shares  ({:,.0f} ES) to {}".format(
+            cv["charm_shares"], es, "BUY" if cv["charm_shares"] > 0 else "SELL"))
+        print("  vanna (+1 vol pt) ...... {:>16,.0f} shares".format(cv["vanna_shares"]))
+        print("  Delta decay accelerates in the last two hours as strikes resolve to 0 or")
+        print("  1 delta. This flow is mechanical -- it carries no information.")
+        if cv["n_expiring_today"] == 0:
+            print("  (no contracts expiring today: this is decay in the surviving book)")
+        print()
+    else:
+        print("  CHARM INTO THE CLOSE")
+        print("  Today's session has settled (past 16:00 ET) -- no decay left to hedge.")
+        print("  Run during RTH to see the mechanical flow; it accelerates in the last 2h.")
+        print()
+
+    # ---- 3. pinning -------------------------------------------------------
+    pins = pin_candidates(all_contracts, spot, cfg, cutoff)
+    if not pins:
+        print("  PINNING   no contracts expiring {} in the fetched window "
+              "(widen --all-days, or pick --expiry-risk DATE).".format(cutoff))
+        print()
+    if pins:
+        secs_left = seconds_to_expiry(cutoff, now)
+        print("  PINNING   largest dealer gamma concentration expiring {}".format(cutoff))
+        print("  {:>9}{:>16}{:>12}   {}".format("strike", "gross gamma", "vs spot", "net"))
+        for p in pins:
+            print("  {:>9,.0f}{:>16}{:>11.2f}%   {}".format(
+                p["strike"], fmt_bn(p["gross"]), p["dist_pct"] * 100, fmt_bn(p["net"])))
+        if secs_left > 0:
+            print("  {:.1f}h of pin pressure left; it decays through the session and is "
+                  "ZERO at the bell.".format(secs_left / 3600.0))
+        else:
+            print("  That expiry has settled -- no pin pressure remains.")
+        print("  Ranked by raw gamma concentration, NOT max pain. Note ETF pins "
+              "({}) are".format(cfg.ticker))
+        print("  weaker than single-name pins; index-level pinning shows up in SPX.")
+        print()
+
+    if oi_date:
+        print("  OI is OCC T+1: this is the {} close, so nothing opened today is in it."
+              .format(oi_date))
+        print()
+    return ro
+
+
 def print_gamma_buckets(contracts, spot, cfg, today):
     """Render gamma_expiry_buckets() as the console table."""
     rows = gamma_expiry_buckets(contracts, spot, cfg, today)
@@ -2164,11 +2221,27 @@ def print_profiles(all_contracts, spot, spy_ratio, cfg, today, now=None):
     return out
 
 
+def week_bounds(today):
+    """Monday..Friday of the current trading week (or, on a weekend, the upcoming one)."""
+    monday = today - timedelta(days=today.weekday())
+    if today.weekday() >= 5:  # Sat/Sun -> next week's Mon-Fri
+        monday += timedelta(days=7)
+    return monday, monday + timedelta(days=4)
+
+
 def fetch_window(expiry_arg, today, all_days):
-    """(from_date, to_date) to fetch for an --expiry value (None = 0DTE + all)."""
+    """(from_date, to_date) to fetch for an --expiry value (None = 0DTE + all).
+
+    from_date is never before today: Schwab's /chains rejects a past fromDate
+    with HTTP 400 (verified live: --expiry week on a Thursday sent Monday).
+    Earlier days of the week have settled anyway, so nothing is lost.
+    """
     e = (expiry_arg or "all").lower()
     if e == "0dte":
         return today, today
+    if e == "week":
+        monday, friday = week_bounds(today)
+        return max(monday, today), friday
     if e == "all":
         return today, today + timedelta(days=all_days)
     d = date.fromisoformat(expiry_arg)
@@ -2182,6 +2255,11 @@ def select_views(all_contracts, expiry_arg, today):
         return [("0DTE", by_0dte), ("ALL EXPIRIES", all_contracts)]
     if expiry_arg.lower() == "0dte":
         return [("0DTE", by_0dte)]
+    if expiry_arg.lower() == "week":
+        monday, friday = week_bounds(today)
+        by_week = [c for c in all_contracts if monday <= c.expiry <= friday]
+        label = "WEEK {} - {}".format(monday.isoformat(), friday.isoformat())
+        return [(label, by_week)]
     if expiry_arg.lower() == "all":
         return [("ALL EXPIRIES", all_contracts)]
     # explicit date
@@ -2229,6 +2307,10 @@ def run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
         print_data_health(spot, ts_ns, dropped, dropped_expired, floored,
                            len(all_contracts), today, prior_trading_session(today))
         print_side_by_side(computed, today)
+        for _d in sorted({today, next_monthly_opex(today)}):
+            if (_d - today).days <= 7:
+                for _line in expiry_mechanics(_d, cfg.ticker):
+                    print("  ** " + _line)
 
         # Hedging-urgency decomposition of the all-expiries population (the
         # governing rule: match the expiry set to the holding period).
@@ -2243,6 +2325,11 @@ def run(cfg, args, all_contracts, spot, spy_ratio, today, ts_ns, dropped,
             main_view = computed[0][1]
         if main_view:
             print_hedging_flow(main_view, spot, cfg, spy_ratio)
+        if getattr(args, "expiry_risk", None):
+            cut = (None if args.expiry_risk == "auto"
+                   else date.fromisoformat(args.expiry_risk))
+            print_expiry_risk(all_contracts, spot, cfg, today, spy_ratio, cutoff=cut,
+                              oi_date=prior_trading_session(today).isoformat())
 
         for lbl, view in computed:
             print_view_detail(lbl, view, spot, spy_ratio, cfg, today)
@@ -2277,11 +2364,15 @@ def main(argv=None):
 
     # Validate --expiry up front so BOTH the demo and live paths reject garbage
     # cleanly instead of tracebacking later in select_views().
-    if args.expiry and args.expiry.lower() not in ("0dte", "all"):
+    if args.expiry and args.expiry.lower() not in ("0dte", "week", "all"):
         try:
-            date.fromisoformat(args.expiry)
+            exp_d = date.fromisoformat(args.expiry)
         except ValueError:
-            print("ERROR: --expiry must be '0dte', 'all', or YYYY-MM-DD.", file=sys.stderr)
+            print("ERROR: --expiry must be '0dte', 'week', 'all', or YYYY-MM-DD.", file=sys.stderr)
+            return 2
+        if exp_d < today:   # also a guaranteed HTTP 400 from Schwab (past fromDate)
+            print("ERROR: --expiry {} is in the past; those contracts have settled.".format(
+                args.expiry), file=sys.stderr)
             return 2
 
     if args.demo:
@@ -2306,25 +2397,17 @@ def main(argv=None):
         print("runtime: {:.2f}s".format(time.time() - t_start))
         return 0
 
-    app_key = os.environ.get("SCHWAB_APP_KEY")
-    app_secret = os.environ.get("SCHWAB_APP_SECRET")
-    if not app_key or not app_secret:
-        print("ERROR: set SCHWAB_APP_KEY and SCHWAB_APP_SECRET in your environment "
-              "(never hardcode them).", file=sys.stderr)
-        print("       Create a Market-Data app at developer.schwab.com to get them.",
-              file=sys.stderr)
+    try:
+        client = get_schwab_client()
+    except RuntimeError as e:
+        print("ERROR: {}".format(e), file=sys.stderr)
         print("       Or run `python3 gex.py --demo` for an offline synthetic example.",
               file=sys.stderr)
         return 2
 
-    token_path = args.token_path or os.environ.get("SCHWAB_TOKEN_PATH", DEFAULT_TOKEN_PATH)
-    try:
-        client = get_schwab_client(app_key, app_secret, token_path)
-    except RuntimeError as e:
-        print("ERROR: {}".format(e), file=sys.stderr)
-        return 2
-
     from_date, to_date = fetch_window(args.expiry, today, args.all_days)
+    if args.expiry_risk:   # roll-off is meaningless without the post-expiry book
+        to_date = max(to_date, today + timedelta(days=args.all_days))
 
     warn = check_futures_symbol(cfg.ticker)
     if warn and warn[0] == "ERROR":

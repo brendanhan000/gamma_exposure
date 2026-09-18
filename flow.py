@@ -178,14 +178,16 @@ def flow_path(ticker, day=None, flow_dir=FLOW_DIR):
 
 def track(ticker, interval, flow_dir=FLOW_DIR, all_days=45, max_polls=None):
     """Poll the chain and accumulate signed flow until interrupted."""
-    app_key = os.environ.get("SCHWAB_APP_KEY")
-    app_secret = os.environ.get("SCHWAB_APP_SECRET")
-    token = os.environ.get("SCHWAB_TOKEN_PATH", gex.DEFAULT_TOKEN_PATH)
-    client = gex.get_schwab_client(app_key, app_secret, token)
+    client = gex.get_schwab_client()
     symbol = gex.to_schwab_symbol(ticker)
     today = gex.now_et().date()
     path = flow_path(ticker, today, flow_dir)
 
+    for _line in gex.expiry_mechanics(today, ticker):
+        print("** " + _line)
+    if gex.is_quarterly_opex(today):
+        print("** Classification below is NOT trustworthy today -- the rebalance MOC and")
+        print("   witching volume swamp the Lee-Ready read.\n")
     print("Tracking {} every {}s -> {}".format(symbol, interval, path))
     print("Lee-Ready on window volume. Ctrl-C to stop.\n")
     print("{:<10}{:>9}{:>12}{:>12}{:>9}  {}".format(
@@ -260,6 +262,11 @@ def report(ticker, flow_dir=FLOW_DIR, day=None, expiry=None, top=15):
         rules[r["rule"]] += 1
 
     total_vol = sum(v["vol"] for v in by_cp.values())
+    day_recorded = date.fromisoformat(os.path.basename(path)[:10])
+    if gex.is_quarterly_opex(day_recorded):
+        print("** {} was QUARTERLY OpEx: the rebalance MOC and witching volume distort"
+              .format(day_recorded))
+        print("   this session's aggressor classification. Treat the verdict as unusable.\n")
     print("=" * 78)
     print("INTRADAY SIGNED FLOW  {}   {}".format(
         ticker.upper(), os.path.basename(path)[:10]))
@@ -351,9 +358,6 @@ def main(argv=None):
     day = date.fromisoformat(a.date) if a.date else None
     if a.report:
         return report(a.ticker, a.flow_dir, day, a.expiry, a.top)
-    if not (os.environ.get("SCHWAB_APP_KEY") and os.environ.get("SCHWAB_APP_SECRET")):
-        print("ERROR: SCHWAB_APP_KEY / SCHWAB_APP_SECRET not set.", file=sys.stderr)
-        return 2
     return track(a.ticker, a.interval, a.flow_dir, a.all_days)
 
 

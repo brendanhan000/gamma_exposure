@@ -7,8 +7,7 @@ to be amplified, and which strikes act as magnets or accelerants.
 
 Data comes from the **Charles Schwab Trader API**. Gamma is **recomputed from scratch** with
 Black-Scholes-Merton on per-strike implied volatility; vendor greeks are never trusted. Output is a
-plain-text bias summary, a per-strike chart, a JSON API, an installable iPhone app, and scheduled
-pre-market push notifications.
+plain-text bias summary, a per-strike chart, a JSON API, and an installable iPhone app.
 
 Built to prioritize **correctness and auditability over features**: every modeling assumption is written
 in code comments *and* printed at runtime.
@@ -71,108 +70,70 @@ mobile app.
 ```bash
 pip install -r requirements.txt
 python3 gex.py --demo          # offline synthetic chain — no credentials needed
+
+# live data (needs the schwab_hub running — see "Schwab setup" below)
+../schwab_hub/run.sh           # terminal 1, leave running
+python3 gex.py --ticker SPY    # terminal 2
 ```
 
 > **Python:** the core is 3.9-compatible (`--demo` and the tests run anywhere). **Live data needs Python
-> ≥ 3.10** because `schwab-py` requires it; `pip install -r requirements.txt` skips it automatically on 3.9
-> via an environment marker.
+> ≥ 3.10** (the hub's `schwab-py` requires it); the shared venv at `../.venv` has everything.
 
 ### Schwab setup (one time, then weekly re-auth)
 
 Schwab market data is **free with a brokerage account** — no per-asset entitlement, and the whole chain
 (spot + OI + IV) arrives in one request.
 
-1. At **developer.schwab.com**, create an app, add the **Market Data Production** product, and set the
-   callback URL to **`https://127.0.0.1:8182`**. Wait for status **Ready For Use** (manual approval, can
-   take days).
-2. Copy the credential template and fill it in:
+Schwab access is handled by the central **schwab_hub** (`../schwab_hub`), which owns the credentials
+and the single token. This project holds no Schwab secrets.
+
+1. Set up the hub once (Schwab app, `.env`, first login) — see `../schwab_hub/README.md`.
+2. Install the client (`pip install -r requirements.txt` does it via `-e ../schwab_hub`) and start the hub:
    ```bash
-   cp .env.example .env          # add SCHWAB_APP_KEY / SCHWAB_APP_SECRET
-   set -a; source .env; set +a
+   ../schwab_hub/run.sh                       # leave running; weekly: ../schwab_hub/run.sh login
    ```
-3. Log in and verify:
+3. Verify the option-chain path:
    ```bash
-   pip install 'schwab-py>=1.3'
-   python3 scripts/schwab_setup.py            # add --manual if the browser flow stalls
+   python3 scripts/schwab_setup.py            # pulls a minimal live chain through the hub
    ```
-   Writes `.schwab_token.json` (git-ignored), then pulls a live chain to confirm the response shape
-   parses before you rely on it.
 
 > 🔑 **Schwab refresh tokens expire every 7 days** and require a browser re-login — there is no headless
-> renewal path. The tool warns from day 5.5 in every push, and failures are labelled
-> `SCHWAB TOKEN EXPIRED` with the exact command to run.
+> renewal path. `../schwab_hub/run.sh status` shows the days left, and `/api/health` reports it too.
 
-### Token reliability — read this if tokens die early
+### Token reliability
 
-Weekly re-login is **unavoidable** (Schwab policy: refresh tokens older than seven days are
-rejected, with no way to extend them). But a token dying in *hours* is a different problem
-with a specific cause:
-
-> ⚠️ **Any process still holding the OLD token will revoke your NEW one.**
-> Schwab treats a superseded refresh token as a compromise signal and revokes the entire
-> token family — including the token you just created. A long-lived `server.py` from
-> yesterday is enough to kill every fresh login you make.
-
-**Always check before re-authenticating:**
-
-```bash
-gexps                       # lists anything holding the token
-pkill -f "server.py"        # only if it found something
-gexauth --manual            # then re-login
-```
-
-**When a token dies, diagnose it instead of guessing:**
-
-```bash
-gexaudit                    # verdict from the token journal
-gexaudit --all --hours 48   # full history
-```
-
-Every token read and write is journaled to `logs/token_audit.log` with the PID, command,
-and a **sha256 fingerprint** of the refresh token (enough to see rotation, never the secret
-itself). `scripts/token_audit.py` reads it and names the pattern: `STALE REUSE` (which
-process presented a superseded token, and when), `CONCURRENCY`, or `RAPID ROTATE`. If it
-finds none of those, the cause was *not* a local race — suspect the 7-day cap or a
-second login elsewhere.
-
-Two safeguards run automatically:
-
-- **Atomic token writes.** `schwab-py`'s default writer opens the token with mode `'w'`,
-  truncating it before writing — a crash or two overlapping writers leaves a corrupt token
-  that Schwab rejects. Writes now go to a temp file (`fsync`) then `os.replace`, which is
-  atomic on POSIX: a reader sees the old token or the new one, never a partial.
-- **Staleness re-checked inside the lock.** Checking before acquiring the lock is a
-  check-then-act race: another process can rotate the token in that window, after which
-  this client holds a superseded one. The check now happens immediately before every API
-  call, and a rotated token is reloaded from disk.
+Early token death came from several processes sharing one token file: a refresh in one
+process rotates the refresh token, and a second process presenting the superseded one makes
+Schwab revoke the whole family. That is fixed structurally: **only the hub holds the token**,
+so there is nothing to race. If a call returns a 401 the hub's token needs renewing
+(`../schwab_hub/run.sh login`).
 
 ---
 
 ## Shell helpers (recommended)
 
-The tool needs three things lined up every time: the right interpreter (the system
-`python3` has no numpy, and `schwab-py` needs ≥ 3.10), the project directory, and
-credentials loaded from `.env`. These `~/.zshrc` functions handle all three, and work
-from **any** directory:
+The tool needs the right interpreter (the shared venv `../.venv`: it has numpy and `schwab_hub_client`)
+and the project directory. These `~/.zshrc` functions handle both, and work from **any** directory:
 
 ```bash
-export GEX_HOME="/Users/brendanhan/Desktop/Quant_Projects/gamma_exposure"
-export PY="/opt/anaconda3/bin/python"
+export GEX_HOME="$HOME/vault/raw/repos/gamma_exposure"
+export PY="$HOME/vault/raw/repos/.venv/bin/python"
 
-gex()       { ( cd "$GEX_HOME" && set -a && . ./.env && set +a && "$PY" gex.py "$@" ); }
-gexserver() { ( cd "$GEX_HOME" && set -a && . ./.env && set +a && "$PY" server.py "$@" ); }
-gexauth()   { ( cd "$GEX_HOME" && set -a && . ./.env && set +a && "$PY" scripts/schwab_setup.py "$@" ); }
-gexoi()     { ( cd "$GEX_HOME" && set -a && . ./.env && set +a && "$PY" scripts/oi_history.py "$@" ); }
-gexaudit()  { ( cd "$GEX_HOME" && "$PY" scripts/token_audit.py "$@" ); }
+gex()       { ( cd "$GEX_HOME" && set -a && { [ ! -f ./.env ] || . ./.env; } && set +a && "$PY" gex.py "$@" ); }
+gexserver() { ( cd "$GEX_HOME" && set -a && { [ ! -f ./.env ] || . ./.env; } && set +a && "$PY" server.py "$@" ); }
+gexauth()   { "$GEX_HOME/../schwab_hub/run.sh" login; }      # weekly Schwab login (owned by the hub)
+gexhub()    { "$GEX_HOME/../schwab_hub/run.sh" "$@"; }        # start the hub / `gexhub status`
+gexoi()     { ( cd "$GEX_HOME" && set -a && { [ ! -f ./.env ] || . ./.env; } && set +a && "$PY" scripts/oi_history.py "$@" ); }
 gexps()     { pgrep -fl "server.py|gex.py" || echo "no gex processes running"; }
 ```
 
 Each runs in a **subshell**, so your working directory and environment are untouched.
 After editing `~/.zshrc`, run `source ~/.zshrc` in already-open terminals (new ones pick
-them up automatically).
+them up automatically). **Live runs need the hub up:** run `gexhub` in one terminal, then `gex` in another.
 
 ```bash
-gex --ticker QQQ --expiry 2026-08-21      # instead of: cd … && set -a && source .env && …
+gexhub                                    # terminal 1: schwab_hub (leave running)
+gex --ticker QQQ --expiry 2026-08-21      # terminal 2
 ```
 
 > Without these, `$PY` is undefined in a fresh terminal and `$PY gex.py …` collapses to
@@ -183,30 +144,43 @@ gex --ticker QQQ --expiry 2026-08-21      # instead of: cd … && set -a && sour
 ## Usage
 
 ```bash
-python3 gex.py                       # default: 0DTE AND all expiries, side by side
-python3 gex.py --ticker QQQ          # any optionable underlying with listed OI
-python3 gex.py --expiry 0dte         # single view
-python3 gex.py --expiry 2026-08-21   # a specific expiration
-python3 gex.py --expiry all --all-days 90        # widen the expiration window
-python3 gex.py --rate 0.0469 --div-yield 0.012   # override r and q
-python3 gex.py --put-sign 1          # flip the dealer put-sign assumption
-python3 gex.py --levels-only         # compact output (used by notifications)
-python3 gex.py --demo                # offline synthetic chain
+gex                                   # default: 0DTE AND all expiries, side by side
+gex --ticker QQQ                     # any optionable underlying with listed OI
+gex --expiry 0dte                    # single view
+gex --expiry week                    # pool all expiries in the current Mon-Fri week
+gex --expiry 2026-08-21              # a specific expiration
+gex --expiry all --all-days 90       # widen the expiration window
+gex --rate 0.0469 --div-yield 0.012  # override r and q
+gex --multiplier 100                 # contract multiplier
+gex --price-range 0.15 --steps 400   # widen/refine the flip search grid
+gex --put-sign 1                     # flip the dealer put-sign assumption
+gex --no-save-chain                  # skip archiving this chain fetch
+gex --chain-dir ~/gex_archive        # archive elsewhere
+gex --no-plot                        # skip chart generation
+gex --out-prefix myrun                # custom chart filename prefix
+gex --levels-only                    # compact output
+gex --profiles                       # intraday + structural profile breakdown
+gex --demo                           # offline synthetic chain, no credentials
 ```
 
-**Flags:** `--ticker` · `--expiry` · `--all-days` (default 45; wider risks a vendor 502) · `--rate` ·
+(No `gex` shell function set up? Use `python3 gex.py ...` from this directory instead — see
+[Shell helpers](#shell-helpers-recommended) above.)
+
+**Flags:** `--ticker` · `--expiry` (`0dte` \| `week` \| `all` \| `YYYY-MM-DD`) ·
+`--all-days` (default 45; wider risks a vendor 502) · `--rate` ·
 `--div-yield` (auto per-ticker if omitted) · `--multiplier` · `--price-range` (±10% flip window) ·
 `--steps` · `--put-sign` ·
 `--no-save-chain` / `--chain-dir` (chain archive; archiving is ON by default) ·
-`--no-plot` · `--out-prefix` · `--levels-only` · `--profiles` · `--token-path` · `--demo`. Full list: `python3 gex.py --help`.
+`--no-plot` · `--out-prefix` · `--levels-only` · `--profiles` · `--demo`. Full list: `gex --help`.
 
 ### When to run what
 
 | Cadence | Command | Why |
 |---|---|---|
 | **Daily** (pre-open) | `gex.py --ticker SPY` | The day's levels. OI updates overnight, so run once before the open. |
+| **Weekly** (Mon) | `--expiry week` | Pool everything expiring this Mon-Fri (the week's total gamma). |
 | **Weekly** (Mon) | `--expiry all --all-days 90` | Structural levels into the next quarter. |
-| **Weekly** (auth) | `scripts/schwab_setup.py` | **Required** — the 7-day refresh token dies otherwise. |
+| **Weekly** (auth) | `../schwab_hub/run.sh login` (or `/setup.html` from the phone) | **Required** — the 7-day refresh token dies otherwise. |
 | **Monthly** (OpEx) | `--expiry <3rd Friday>` | Monthly OpEx holds the bulk of OI; levels reset after it. |
 | **Quarterly** | `--rate <current> --div-yield <current>` | Triple witching, plus refresh your rate/yield assumptions. |
 
@@ -230,8 +204,8 @@ expiry-bucket table.
 `GET /api/expirations?ticker=` · `GET /api/health` · interactive docs at `/docs`.
 
 Results cache for 60s unless `fresh=1` (the app's refresh button always sends it, so spot and IV are
-never a replayed snapshot). The server rebuilds its Schwab client when the token file changes, so it
-heals itself after a re-login with no restart. LAN-only by default — for remote access, use Tailscale
+never a replayed snapshot). The server holds no Schwab token (the hub does), so it keeps working after a hub
+re-login with no restart, but it needs the hub running. LAN-only by default — for remote access, use Tailscale
 on both devices.
 
 ### Re-authenticate from the phone — `/setup.html`
@@ -241,51 +215,21 @@ Since the weekly re-login is permanent, it doesn't have to mean finding a laptop
 **`http://<mac-lan-ip>:8787/setup.html`** → tap **START LOGIN** → approve on Schwab → you land on a
 "can't open the page" error (expected) → copy the address bar → paste → **INSTALL TOKEN**.
 
-The server exchanges the code, writes the token atomically, drops its cached client, clears caches, and
-reports days remaining. Two ways to reach it without typing the URL: the header token indicator is
+The server relays the pasted URL to the hub, which exchanges the code and writes the token atomically; the
+server then clears its caches and reports days remaining. Two ways to reach it without typing the URL: the header token indicator is
 tappable and turns **amber inside the last 1.5 days**, and any auth failure shows a
 **"Re-authenticate now →"** link.
 
 Endpoints: `GET /api/auth/start` (returns the authorize URL) · `POST /api/auth/complete`
-(`{"redirect_url": "…"}`). The app secret never leaves the server — the browser only handles the
-short-lived authorization code, exactly as in the CLI flow. The exchange holds the token lock, and the
-result is validated: a token written without a refresh token is rejected immediately rather than dying
-30 minutes later.
+(`{"redirect_url": "…"}`). These are thin relays to the hub's `/auth/start` and `/auth/complete`. The app secret never leaves
+the hub — the browser only handles the short-lived authorization code. The hub validates the result: a token
+written without a refresh token is rejected immediately rather than dying 30 minutes later.
 
 **Always-on service:**
 ```bash
 cp scripts/com.brendanhan.gex-server.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-server.plist
 ```
-
----
-
-## Scheduled push notifications
-
-`scripts/daily_gex.sh <cadence>` runs the tool for each ticker and pushes levels + charts to your phone via
-**ntfy** (`NTFY_TOPIC` in `.env`).
-
-| Cadence | Schedule (CT / ET) | Window | Plist |
-|---|---|---|---|
-| daily | Mon–Fri 07:45 / 08:45 | 45 days | `com.brendanhan.gex-daily.plist` |
-| weekly | Monday 07:50 / 08:50 | 90 days | `com.brendanhan.gex-weekly.plist` |
-| monthly | 1st of month 07:55 | 150 days | `com.brendanhan.gex-monthly.plist` |
-
-```bash
-bash scripts/daily_gex.sh daily        # test by hand
-for c in daily weekly monthly; do      # install the schedules
-  cp scripts/com.brendanhan.gex-$c.plist ~/Library/LaunchAgents/
-  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.brendanhan.gex-$c.plist
-done
-```
-
-Tickers and windows are overridable in `.env` (`GEX_TICKERS`, `GEX_{DAILY,WEEKLY,MONTHLY}_DAYS`,
-`GEX_SEND_CHARTS`). Failure is itself a notification: titles distinguish success, `PARTIAL (1/2 ok)`,
-`RUN FAILED`, and `SCHWAB TOKEN EXPIRED`.
-
-**Notes:** the Mac must be awake at fire time (launchd runs a missed job on next wake). `/bin/bash` needs
-**Full Disk Access** if the project lives under `~/Desktop` (System Settings → Privacy & Security).
-Market holidays are not skipped — you get the prior session's levels.
 
 ---
 
@@ -683,7 +627,7 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 - **Charm and vanna are not modeled** — they dominate into monthly OpEx roll-off.
 - Uses vendor per-strike IV; quote filters catch the worst, but garbage IV in → garbage gamma out.
 - **Sticky-strike** repricing and **European-exercise** gamma are stated approximations.
-- Schwab OAuth needs an **approved** developer app and a **weekly** browser re-login.
+- Schwab OAuth needs an **approved** developer app and a **weekly** browser re-login (`../schwab_hub/run.sh login`); the hub must be running for live data.
 
 ---
 
@@ -691,25 +635,22 @@ rebalanced today. Weight by hedging urgency, not magnitude alone.
 
 | Path | Role |
 |---|---|
-| `gex.py` | Quant core + Schwab data layer + token persistence + rendering + CLI |
-| `gex.py` core tests | `test_gex.py` — 63 pytest cases (no network) |
+| `gex.py` | Quant core + Schwab data layer (via `schwab_hub_client`) + rendering + CLI |
+| `gex.py` core tests | `test_gex.py` — 60 pytest cases (no network) |
 | `server.py` | FastAPI JSON API, caching, client lifecycle, phone re-auth endpoints |
 | `static/index.html` | Installable iOS PWA (levels) |
 | `static/setup.html` | Phone-based Schwab re-authentication |
-| `scripts/schwab_setup.py` | Terminal OAuth login + token validation + live verification |
+| `scripts/schwab_setup.py` | Live verification of the Schwab chain path (login lives in `../schwab_hub`) |
 | `scripts/oi_history.py` | Chain-archive dOI analysis |
-| `scripts/token_audit.py` | Diagnoses early token expiry from the token journal |
-| `scripts/daily_gex.sh` | Multi-cadence notifier |
-| `scripts/*.plist` | 4 launchd agents (3 push cadences + API server) |
+| `scripts/com.brendanhan.gex-server.plist` | launchd agent for the always-on API server |
 | `test_flow.py` | 11 pytest cases for the flow tracker (no network) |
 | `chains/` | Chain archive — **not regenerable, back this up** (git-ignored) |
-| `logs/token_audit.log` | Token read/write journal (fingerprints only, no secrets) |
 | `GEX_Technical_Reference.pdf` | Full technical documentation |
 
 ## Tests
 
 ```bash
-python3 -m pytest test_gex.py test_flow.py -v    # 70 tests, no network
+python3 -m pytest test_gex.py test_flow.py -v    # 72 tests, no network
 ```
 
 Validation is against **independently derived truth**, not recorded output:
@@ -725,9 +666,5 @@ Validation is against **independently derived truth**, not recorded output:
 - **Flip time-decay**: the close-of-day projection returns both the current and T-decayed flip, drops
   contracts that expire inside the window, and floors tiny `T` consistently with the live snapshot.
 - **0DTE staleness escalation**: the caveat fires on 0DTE views with a flip and never on other views.
-- **Token persistence**: writes are atomic (a failed write leaves the previous token intact), the
-  journal records rotation via fingerprints, and **raw refresh tokens never appear in the log**.
-- **Stale-client reload**: a token rotated by another process forces a rebuild before the next call —
-  the fix for tokens dying in hours instead of days.
 - Plus: quote-filter behavior (including **wing preservation**), OpEx calendar arithmetic, retry
-  classification (transient vs. auth), and cross-process token-lock exclusivity via a real subprocess.
+  classification (transient vs. auth), and that the Schwab client is the hub client.

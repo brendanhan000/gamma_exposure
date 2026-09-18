@@ -131,9 +131,7 @@ def load_levels(chain_dir, ticker, cfg):
 # ---------------------------------------------------------------------------
 def fetch_ohlc(ticker, start, end):
     """{date: (open, high, low, close)} from Schwab daily candles."""
-    client = gex.get_schwab_client(
-        os.environ.get("SCHWAB_APP_KEY"), os.environ.get("SCHWAB_APP_SECRET"),
-        os.environ.get("SCHWAB_TOKEN_PATH", gex.DEFAULT_TOKEN_PATH))
+    client = gex.get_schwab_client()
     resp = client.get_price_history_every_day(
         gex.to_schwab_symbol(ticker),
         start_datetime=datetime(start.year, start.month, start.day),

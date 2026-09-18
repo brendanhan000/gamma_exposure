@@ -820,85 +820,6 @@ def test_zero_dte_cliff_quantifies_what_expires():
     assert gex.zero_dte_cliff(cs[1:], 100.0, cfg, today, now=at_close) is None
 
 
-def test_token_write_is_atomic_and_journaled(tmp_path, monkeypatch):
-    # schwab-py's default writer opens the token with mode 'w', which TRUNCATES
-    # before writing: a crash or two overlapping writers can leave a corrupt
-    # token that Schwab rejects. Ours writes to a temp file and os.replace()s,
-    # so a reader sees either the old token or the new one -- never a partial.
-    import gex
-    import json
-
-    p = tmp_path / "tok.json"
-    p.write_text(json.dumps({"creation_timestamp": 1,
-                             "token": {"refresh_token": "RT_ONE", "expires_at": 111}}))
-    monkeypatch.setattr(gex, "TOKEN_AUDIT_LOG", str(tmp_path / "audit.log"))
-
-    read, write = gex._token_reader(str(p)), gex._token_writer(str(p))
-    before = read()
-    write({"creation_timestamp": 1, "token": {"refresh_token": "RT_TWO", "expires_at": 222}})
-    after = read()
-
-    assert after["token"]["refresh_token"] == "RT_TWO"
-    assert json.loads(p.read_text())                       # still valid JSON
-    assert not [f for f in os.listdir(str(tmp_path)) if f.startswith(".schwab_tok")]
-
-    # A failed write must not destroy the existing token (atomicity).
-    orig = p.read_text()
-    with pytest.raises(TypeError):
-        write({"bad": {1, 2, 3}})                          # sets are not JSON-serializable
-    assert p.read_text() == orig
-
-    # Journal records both touches, with rotation visible via fingerprints.
-    log = (tmp_path / "audit.log").read_text()
-    assert "READ" in log and "WRITE" in log
-    assert gex._token_fingerprint(before) != gex._token_fingerprint(after)
-    # Fingerprints must never leak the secret itself.
-    assert "RT_ONE" not in log and "RT_TWO" not in log
-
-
-def test_reload_client_if_stale_rebuilds_on_rotation(tmp_path, monkeypatch):
-    # THE fix for tokens dying within hours: a client whose token file changed
-    # underneath it must be rebuilt before use, or it presents a superseded
-    # refresh token and Schwab revokes the whole family.
-    import gex
-    import time as _t
-
-    tok = tmp_path / "tok.json"
-    tok.write_text('{"token": {}}')
-
-    class _C:
-        pass
-
-    built = []
-
-    def fake_build(key, sec, path):
-        c = _C()
-        c._gex_token_path = path
-        c._gex_token_mtime = gex._token_mtime(path)
-        c._gex_app_key, c._gex_app_secret = key, sec
-        built.append(c)
-        return c
-
-    monkeypatch.setattr(gex, "get_schwab_client", fake_build)
-    c1 = fake_build("K", "S", str(tok))
-
-    # Unchanged file -> same object, no needless rebuild.
-    assert gex.reload_client_if_stale(c1) is c1
-    assert len(built) == 1
-
-    # Token rotated by another process -> must hand back a REBUILT client.
-    _t.sleep(0.01)
-    os.utime(str(tok), (_t.time() + 5, _t.time() + 5))
-    c2 = gex.reload_client_if_stale(c1)
-    assert c2 is not c1 and len(built) == 2
-
-    # A client with no stamped credentials degrades safely instead of raising.
-    bare = _C()
-    bare._gex_token_path = str(tok)
-    bare._gex_token_mtime = None
-    assert gex.reload_client_if_stale(bare) is bare
-
-
 def test_chain_archive_persists_raw_rows(tmp_path):
     # The archive must keep what the GEX filters THROW AWAY: zero-OI strikes and
     # the -999 IV sentinel are the baseline tomorrow's dOI is measured against.
@@ -1060,55 +981,14 @@ def test_fetch_chain_does_not_retry_auth_or_4xx():
     assert n.calls == 1
 
 
-def test_token_lock_is_exclusive_across_processes(tmp_path):
-    # The lock must actually exclude a second holder (Schwab rotates the refresh
-    # token on refresh; concurrent refreshes revoke each other).
+def test_get_schwab_client_returns_the_hub_client_without_credentials(monkeypatch):
     import gex
-    import os
-    import subprocess
-    import sys
-    import time
+    from schwab_hub_client import HubClient
 
-    tok = tmp_path / "tok.json"
-    tok.write_text("{}")
-    with gex.token_lock(str(tok)):
-        # A separate PROCESS must fail to take the same flock while we hold it.
-        code = (
-            "import fcntl,sys\n"
-            "f=open(%r,'a+')\n"
-            "try:\n"
-            "    fcntl.flock(f.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); print('ACQUIRED')\n"
-            "except OSError: print('BLOCKED')\n" % (str(tok) + ".lock")
-        )
-        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-        assert "BLOCKED" in out.stdout
-
-    # Released afterwards.
-    out2 = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-    assert "ACQUIRED" in out2.stdout
-
-
-def test_token_lock_timeout_proceeds_unlocked(tmp_path):
-    # A stuck lock must NOT hard-fail the run (outage > race).
-    import gex
-    tok = tmp_path / "t.json"
-    tok.write_text("{}")
-    ran = []
-    with gex.token_lock(str(tok), timeout=0.0):
-        with gex.token_lock(str(tok), timeout=0.05):   # cannot acquire; proceeds
-            ran.append(True)
-    assert ran == [True]
-
-
-def test_get_schwab_client_errors_without_creds_or_token(tmp_path):
-    # get_schwab_client raises a clear RuntimeError BEFORE importing schwab-py,
-    # so these checks pass on Python 3.9 (where schwab-py can't be installed).
-    import gex
-
-    with pytest.raises(RuntimeError):                       # missing credentials
-        gex.get_schwab_client(None, None, str(tmp_path / "t.json"))
-    with pytest.raises(RuntimeError):                       # missing token file
-        gex.get_schwab_client("KEY", "SECRET", str(tmp_path / "missing.json"))
+    monkeypatch.delenv("SCHWAB_APP_KEY", raising=False)
+    monkeypatch.delenv("SCHWAB_APP_SECRET", raising=False)
+    client = gex.get_schwab_client()
+    assert isinstance(client, HubClient)
 
 
 def test_schwab_setup_script_importable():
@@ -1122,8 +1002,6 @@ def test_schwab_setup_script_importable():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert callable(mod.main)
-    assert isinstance(mod.CALLBACK, str) and mod.CALLBACK
-    assert mod.TOKEN_PATH  # default token path is defined
 
 
 # ---------------------------------------------------------------------------
@@ -1180,3 +1058,127 @@ def test_delta_report_grades_lean_by_opening_ratio(tmp_path, capsys):
     # The churned strike's lean is suppressed (no SHORT/LONG gamma tag on its row).
     churn_line = [ln for ln in out.splitlines() if "580" in ln]
     assert churn_line and "dealer" not in churn_line[0]
+
+
+def test_expiry_week_passes_validation_and_pools_mon_to_fri():
+    # Regression: 'week' was wired into select_views/fetch_window but main()'s
+    # up-front validation only allowed 0dte/all, so --expiry week exited 2.
+    import gex
+    assert gex.main(["--demo", "--expiry", "week", "--no-plot", "--levels-only"]) == 0
+
+    # Sunday 2026-09-13 -> the upcoming week; any weekday -> its own week.
+    wk = (date(2026, 9, 14), date(2026, 9, 18))
+    assert gex.week_bounds(date(2026, 9, 13)) == wk      # Sunday
+    assert gex.week_bounds(date(2026, 9, 16)) == wk      # Wednesday
+    assert gex.week_bounds(date(2026, 9, 18)) == wk      # Friday
+    assert gex.fetch_window("week", date(2026, 9, 13), 45) == wk
+    # Midweek the fetch must START TODAY: Schwab 400s on a past fromDate
+    # (verified live on Thu 2026-09-17 with fromDate=Monday).
+    assert gex.fetch_window("week", date(2026, 9, 17), 45) == (date(2026, 9, 17), wk[1])
+    # A past explicit expiry is rejected up front instead of 400ing.
+    assert gex.main(["--demo", "--expiry", "2020-01-02", "--no-plot"]) == 2
+
+    cs = [Contract(100.0, date(2026, 9, d), "call", 1.0, 0.2) for d in (11, 14, 16, 18, 21)]
+    (label, pooled), = gex.select_views(cs, "week", date(2026, 9, 13))
+    assert [c.expiry.day for c in pooled] == [14, 16, 18]
+    assert "2026-09-14" in label and "2026-09-18" in label
+
+
+# ---------------------------------------------------------------------------
+# Expiry mechanics: roll-off, charm, pinning
+# ---------------------------------------------------------------------------
+def test_quarterly_opex_and_settlement_warnings():
+    import gex
+    assert gex.is_quarterly_opex(date(2026, 9, 18))       # 3rd Fri of Sep
+    assert not gex.is_quarterly_opex(date(2026, 8, 21))   # monthly, not quarterly
+    assert not gex.is_quarterly_opex(date(2026, 9, 11))   # ordinary weekly
+
+    q = " ".join(gex.expiry_mechanics(date(2026, 9, 18), "SPY"))
+    assert "SET" in q and "OPENING print" in q            # AM settlement
+    assert "PM-settled" in q                              # and the ETF contrast
+    assert "rebalance" in q and "MOC" in q
+    m = " ".join(gex.expiry_mechanics(date(2026, 8, 21), "QQQ"))
+    assert "MONTHLY" in m and "SET" not in m
+    assert gex.expiry_mechanics(date(2026, 9, 16), "SPY") == []   # a Wednesday
+
+
+def test_gamma_rolloff_can_flip_the_regime_with_no_price_change():
+    # The point of the feature: gamma that pins the board today can expire and
+    # leave a different regime behind at an UNCHANGED spot.
+    import gex
+    cfg = _cfg()
+    today, cutoff, later = date(2026, 9, 17), date(2026, 9, 18), date(2026, 10, 16)
+    near = [Contract(100.0, cutoff, "call", 8000.0, 0.2, T=1.0 / 365)]      # +gamma, dies
+    far = [Contract(100.0, later, "put", 4000.0, 0.2, T=30.0 / 365)]        # -gamma, lives
+    ro = gex.gamma_rolloff(near + far, 100.0, cfg, cutoff)
+
+    assert ro["n_expiring"] == 1 and ro["n_surviving"] == 1
+    assert 0.0 < ro["expiring_share"] < 1.0
+    assert ro["before"]["total"] > 0 > ro["after"]["total"]   # long -> short gamma
+    assert ro["after"]["n"] == 1
+
+    # Nothing surviving must be reported as empty, not crash.
+    assert gex.gamma_rolloff(near, 100.0, cfg, cutoff)["after"].get("empty")
+
+
+def test_charm_flow_direction_matches_delta_migration():
+    # Dealers long calls hedge by shorting stock. Into the bell an OTM call
+    # decays toward 0 delta (they BUY the hedge back); an ITM call goes to 1
+    # delta (they SELL more). Spot is held fixed -- this is pure charm.
+    import gex
+    now = datetime(2026, 9, 17, 14, 0, tzinfo=gex.ET)
+    cfg = _cfg()
+
+    def charm(strike):
+        cs, _, _ = gex.enrich_and_filter_time(
+            [Contract(strike, now.date(), "call", 1000.0, 0.2)], now)
+        return gex.charm_vanna_flow(cs, 600.0, cfg, now=now)
+
+    otm, itm = charm(601.0), charm(599.0)
+    assert otm["charm_shares"] > 0      # buy back
+    assert itm["charm_shares"] < 0      # sell more
+    assert otm["delta_close"] < otm["delta_now"]
+    assert itm["delta_close"] > itm["delta_now"]
+
+    # Expiring contracts must NOT be dropped: settlement extinguishes that delta
+    # via exercise, it is not traded, so counting it as flow would be a fiction.
+    deep = charm(400.0)
+    assert deep["delta_close"] == pytest.approx(100.0 * 1000.0, rel=0.01)
+    assert abs(deep["charm_shares"]) < 1000.0
+
+    # After the bell there is no decay left to hedge.
+    after = datetime(2026, 9, 17, 17, 0, tzinfo=gex.ET)
+    cs, _, _ = gex.enrich_and_filter_time(
+        [Contract(601.0, date(2026, 9, 18), "call", 1000.0, 0.2)], after)
+    assert gex.charm_vanna_flow(cs, 600.0, cfg, now=after) is None
+
+
+def test_pin_candidates_rank_by_gross_not_net():
+    # Same lesson as the per-side walls: a strike loaded with BOTH call and put
+    # gamma nets to ~zero but is the biggest pin on the board.
+    import gex
+    cfg = _cfg()
+    day = date(2026, 9, 18)
+    cs = [
+        Contract(100.0, day, "call", 5000.0, 0.2, T=1.0 / 365),   # contested strike
+        Contract(100.0, day, "put", 5000.0, 0.2, T=1.0 / 365),
+        Contract(105.0, day, "call", 3000.0, 0.2, T=1.0 / 365),   # one-sided
+        Contract(110.0, date(2026, 10, 16), "call", 9e6, 0.2, T=30.0 / 365),  # other expiry
+    ]
+    pins = gex.pin_candidates(cs, 100.0, cfg, day)
+    assert pins[0]["strike"] == 100.0
+    assert abs(pins[0]["net"]) < pins[0]["gross"]      # nets out, still ranks first
+    assert 110.0 not in [p["strike"] for p in pins]    # other expiries excluded
+    assert pins[0]["dist_pct"] == pytest.approx(0.0)
+    assert gex.pin_candidates(cs, 100.0, cfg, date(2026, 12, 18)) == []
+
+
+def test_dealer_delta_signs_follow_the_convention():
+    import gex
+    cfg = _cfg()   # standard: dealers long calls, short puts
+    deep_call = [Contract(1.0, date(2027, 1, 1), "call", 10.0, 0.2, T=1.0)]
+    # Deep ITM call -> delta ~1 -> dealer book long 10 * 100 shares.
+    assert gex.dealer_delta_shares(deep_call, 100.0, cfg) == pytest.approx(1000.0, rel=0.01)
+    deep_put = [Contract(1000.0, date(2027, 1, 1), "put", 10.0, 0.2, T=1.0)]
+    # Deep ITM put -> delta ~-1, and dealers are SHORT puts -> +1000 shares.
+    assert gex.dealer_delta_shares(deep_put, 100.0, cfg) == pytest.approx(1000.0, rel=0.05)

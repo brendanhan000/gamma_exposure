@@ -3,8 +3,8 @@ numpy>=1.24
 matplotlib>=3.6
 pytest>=7.0
 
-# Live data source: Charles Schwab Trader API via schwab-py (OAuth + token refresh).
-# schwab-py needs Python >= 3.10; its import is lazy, so --demo and the unit tests
-# still run on 3.9 without it. The environment marker makes `pip install -r` SKIP it
-# on 3.9 and install it on 3.10+. (Mirrors the overnight_vs_intraday project.)
-schwab-py>=1.3 ; python_version >= "3.10"
+# Live data source: Charles Schwab Trader API, served by the local schwab_hub
+# (../schwab_hub; run it with ../schwab_hub/run.sh). This installs its client package.
+# The hub needs Python >= 3.10; the marker makes `pip install -r` skip it on 3.9, where
+# --demo and the unit tests still run.
+-e ../schwab_hub ; python_version >= "3.10"
